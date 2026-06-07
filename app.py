@@ -1,3 +1,4 @@
+MODAL_SUMMARIZE_URL = "https://kinggondal731--scholar-lens-summarizer-summarize-paper.modal.run"
 from __future__ import annotations
 
 import html
@@ -247,18 +248,21 @@ def search_all_sources(query: str) -> tuple[str, str]:
     return status, _render_results_table(results)
 
 
-def summarize_text(text: str) -> str:
-    clean_text = " ".join(text.strip().split())
-    if not clean_text:
-        return "Paste an abstract, paper excerpt, or research notes to summarize."
+def summarize_with_modal(text: str) -> str:
+    """Call Modal to generate a real AI summary"""
+    if not text or len(text.strip()) < 50:
+        return "Please provide a longer abstract or paper text to summarize."
 
-    sentences = re.split(r"(?<=[.!?])\s+", clean_text)
-    if len(sentences) <= 3:
-        return clean_text
-
-    summary = " ".join(sentences[:3])
-    return summary if len(summary) <= 900 else f"{summary[:897].rstrip()}..."
-
+    try:
+        response = requests.post(
+            MODAL_SUMMARIZE_URL,
+            json={"text": text},
+            timeout=120
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
 
 CUSTOM_CSS = """
 :root {
@@ -495,14 +499,14 @@ def build_app() -> gr.Blocks:
                         placeholder="Paste an abstract, excerpt, or research notes...",
                         lines=10,
                     )
-                    summarize_button = gr.Button("Summarize", variant="primary")
+                    summarize_button = gr.Button("Summarize with AI", variant="primary")
                     summary_output = gr.Textbox(
                         label="Summary",
                         lines=6,
                         interactive=False,
                     )
                     summarize_button.click(
-                        fn=summarize_text,
+                        fn=summarize_with_modal,
                         inputs=source_text,
                         outputs=summary_output,
                         show_progress="full",
