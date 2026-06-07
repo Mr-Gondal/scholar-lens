@@ -1,4 +1,3 @@
-MODAL_SUMMARIZE_URL = "https://kinggondal731--scholar-lens-summarizer-summarize-paper.modal.run"
 from __future__ import annotations
 
 import html
@@ -15,6 +14,7 @@ import requests
 APP_TITLE = "Scholar Lens"
 SEARCH_LIMIT_PER_SOURCE = 8
 REQUEST_TIMEOUT_SECONDS = 12
+MODAL_SUMMARIZE_URL = "https://kinggondal731--scholar-lens-summarizer-summarize-paper.modal.run"
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class PaperResult:
     authors: str
     citations: str
     url: str
+    abstract: str = ""
 
 
 def _safe_text(value: Any, fallback: str = "Unknown") -> str:
@@ -58,7 +59,7 @@ def search_semantic_scholar(query: str) -> tuple[list[PaperResult], str | None]:
     params = {
         "query": query,
         "limit": SEARCH_LIMIT_PER_SOURCE,
-        "fields": "title,year,authors,citationCount,url",
+        "fields": "title,year,authors,citationCount,url,abstract",
     }
 
     try:
@@ -77,6 +78,7 @@ def search_semantic_scholar(query: str) -> tuple[list[PaperResult], str | None]:
                 authors=_shorten_authors(authors),
                 citations=_safe_text(paper.get("citationCount"), "0"),
                 url=_safe_text(paper.get("url"), "#"),
+                abstract=_safe_text(paper.get("abstract"), ""),
             )
         )
     return results, None
@@ -105,6 +107,7 @@ def search_arxiv(query: str) -> tuple[list[PaperResult], str | None]:
         title = " ".join((entry.findtext("atom:title", default="", namespaces=namespace)).split())
         published = entry.findtext("atom:published", default="", namespaces=namespace)
         link = entry.findtext("atom:id", default="#", namespaces=namespace)
+        abstract = " ".join((entry.findtext("atom:summary", default="", namespaces=namespace)).split())
         authors = [
             author.findtext("atom:name", default="", namespaces=namespace)
             for author in entry.findall("atom:author", namespace)
@@ -117,6 +120,7 @@ def search_arxiv(query: str) -> tuple[list[PaperResult], str | None]:
                 authors=_shorten_authors(authors),
                 citations="N/A",
                 url=_safe_text(link, "#"),
+                abstract=_safe_text(abstract, ""),
             )
         )
     return results, None
@@ -143,7 +147,8 @@ def search_pubmed(query: str) -> tuple[list[PaperResult], str | None]:
             summary_url,
             {"db": "pubmed", "id": ",".join(paper_ids), "retmode": "json"},
         )
-    except requests.RequestException:
+        abstracts_by_id = _fetch_pubmed_abstracts(paper_ids)
+    except (requests.RequestException, ET.ParseError):
         return [], "PubMed is unavailable right now."
 
     summaries = summary_payload.get("result", {})
@@ -159,9 +164,40 @@ def search_pubmed(query: str) -> tuple[list[PaperResult], str | None]:
                 authors=_shorten_authors(authors),
                 citations="N/A",
                 url=f"https://pubmed.ncbi.nlm.nih.gov/{paper_id}/",
+                abstract=abstracts_by_id.get(paper_id, ""),
             )
         )
     return results, None
+
+
+def _fetch_pubmed_abstracts(paper_ids: list[str]) -> dict[str, str]:
+    if not paper_ids:
+        return {}
+
+    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    response = requests.get(
+        fetch_url,
+        params={
+            "db": "pubmed",
+            "id": ",".join(paper_ids),
+            "retmode": "xml",
+        },
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.text)
+
+    abstracts: dict[str, str] = {}
+    for article in root.findall(".//PubmedArticle"):
+        paper_id = article.findtext(".//PMID", default="")
+        abstract_parts = [
+            " ".join(part.itertext()).strip()
+            for part in article.findall(".//Abstract/AbstractText")
+        ]
+        abstract = " ".join(part for part in abstract_parts if part)
+        if paper_id and abstract:
+            abstracts[paper_id] = abstract
+    return abstracts
 
 
 def _source_badge(source: str) -> str:
@@ -189,12 +225,13 @@ def _render_results_table(results: list[PaperResult]) -> str:
         rows.append(
             textwrap.dedent(
                 f"""
-                <tr class="result-row" onclick="window.open('{safe_url}', '_blank', 'noopener,noreferrer')">
+                <tr class="result-row">
                     <td class="title-cell">{html.escape(result.title)}</td>
                     <td>{html.escape(result.year)}</td>
                     <td>{_source_badge(result.source)}</td>
                     <td>{html.escape(result.authors)}</td>
                     <td class="citation-cell">{html.escape(result.citations)}</td>
+                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">Open</a></td>
                 </tr>
                 """
             ).strip()
@@ -210,6 +247,7 @@ def _render_results_table(results: list[PaperResult]) -> str:
                     <th>Source</th>
                     <th>Authors</th>
                     <th>Citations</th>
+                    <th>Link</th>
                 </tr>
             </thead>
             <tbody>{''.join(rows)}</tbody>
@@ -218,12 +256,30 @@ def _render_results_table(results: list[PaperResult]) -> str:
     """
 
 
-def search_all_sources(query: str) -> tuple[str, str]:
+def _results_to_dataframe(results: list[PaperResult]) -> list[list[str]]:
+    return [
+        [
+            str(index + 1),
+            result.title,
+            result.year,
+            result.source,
+            result.authors,
+            result.citations,
+            "Available" if result.abstract else "Missing",
+        ]
+        for index, result in enumerate(results)
+    ]
+
+
+def search_all_sources(query: str) -> tuple[str, str, list[list[str]], list[PaperResult], int | None]:
     clean_query = query.strip()
     if not clean_query:
         return (
             "Enter a research topic to search Semantic Scholar, arXiv, and PubMed.",
             _render_results_table([]),
+            [],
+            [],
+            None,
         )
 
     search_functions = (search_semantic_scholar, search_arxiv, search_pubmed)
@@ -245,11 +301,14 @@ def search_all_sources(query: str) -> tuple[str, str]:
     else:
         status = f"Found {len(results)} papers across all sources."
 
-    return status, _render_results_table(results)
+    if not results:
+        status = "No papers found. Try a broader research topic or a different phrase."
+
+    return status, _render_results_table(results), _results_to_dataframe(results), results, None
 
 
 def summarize_with_modal(text: str) -> str:
-    """Call Modal to generate a real AI summary"""
+    """Call Modal to generate a real AI summary."""
     if not text or len(text.strip()) < 50:
         return "Please provide a longer abstract or paper text to summarize."
 
@@ -257,12 +316,70 @@ def summarize_with_modal(text: str) -> str:
         response = requests.post(
             MODAL_SUMMARIZE_URL,
             json={"text": text},
-            timeout=120
+            timeout=120,
         )
         response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        return f"Error generating summary: {str(e)}"
+        payload = response.json()
+        if isinstance(payload, dict):
+            return _safe_text(payload.get("summary") or payload.get("error"), "No summary returned.")
+        return _safe_text(payload, "No summary returned.")
+    except requests.RequestException:
+        return "The AI summarizer is unavailable right now. Please try again shortly."
+
+
+def select_result(event: gr.SelectData) -> int | None:
+    if event.index is None:
+        return None
+    row_index = event.index[0] if isinstance(event.index, tuple) else event.index
+    return int(row_index)
+
+
+def load_selected_paper(
+    selected_index: int | None,
+    results: list[PaperResult],
+) -> tuple[str, str, str, gr.Tabs]:
+    if selected_index is None or selected_index >= len(results):
+        return (
+            "",
+            "Select a paper from the results table first.",
+            "",
+            gr.update(selected="summarize"),
+        )
+
+    paper = results[selected_index]
+    abstract = paper.abstract.strip()
+    if not abstract:
+        return (
+            f"{paper.title}\n\nNo abstract is available for this result. Paste paper text here to summarize it.",
+            "This paper does not include an abstract from the source API.",
+            "",
+            gr.update(selected="summarize"),
+        )
+
+    paper_text = f"Title: {paper.title}\n\nAbstract: {abstract}"
+    return paper_text, f"Loaded: {paper.title}", "", gr.update(selected="summarize")
+
+
+def summarize_selected_paper(
+    selected_index: int | None,
+    results: list[PaperResult],
+) -> tuple[str, str, str, gr.Tabs]:
+    paper_text, load_status, _, tab_update = load_selected_paper(selected_index, results)
+    if not paper_text or "No abstract is available" in paper_text:
+        return paper_text, load_status, "", tab_update
+    return paper_text, load_status, summarize_with_modal(paper_text), tab_update
+
+
+def clear_search() -> tuple[str, str, list[list[str]], list[PaperResult], int | None, str, str]:
+    return (
+        "Enter a research topic to begin.",
+        _render_results_table([]),
+        [],
+        [],
+        None,
+        "",
+        "",
+    )
 
 CUSTOM_CSS = """
 :root {
@@ -334,6 +451,10 @@ CUSTOM_CSS = """
     min-height: 24px;
 }
 
+.search-actions {
+    align-items: stretch;
+}
+
 .table-shell {
     overflow-x: auto;
     border: 1px solid var(--sl-border);
@@ -344,7 +465,7 @@ CUSTOM_CSS = """
 .results-table {
     width: 100%;
     border-collapse: collapse;
-    min-width: 860px;
+    min-width: 940px;
 }
 
 .results-table th {
@@ -367,12 +488,21 @@ CUSTOM_CSS = """
 }
 
 .result-row {
-    cursor: pointer;
-    transition: background 140ms ease, transform 140ms ease;
+    transition: background 140ms ease;
 }
 
 .result-row:hover {
     background: var(--sl-panel-soft);
+}
+
+.paper-link {
+    color: #93c5fd;
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.paper-link:hover {
+    text-decoration: underline;
 }
 
 .title-cell {
@@ -431,6 +561,13 @@ CUSTOM_CSS = """
     margin: 0;
     color: var(--sl-muted);
 }
+
+.summarize-panel {
+    border: 1px solid var(--sl-border);
+    border-radius: 8px;
+    padding: 18px;
+    background: rgba(17, 28, 51, 0.72);
+}
 """
 
 
@@ -459,9 +596,12 @@ def build_app() -> gr.Blocks:
                 """
             )
 
-            with gr.Tabs():
-                with gr.Tab("Search"):
-                    with gr.Row():
+            papers_state = gr.State([])
+            selected_index_state = gr.State(None)
+
+            with gr.Tabs(selected="search") as app_tabs:
+                with gr.Tab("Search", id="search"):
+                    with gr.Row(elem_classes=["search-actions"]):
                         query_input = gr.Textbox(
                             label="",
                             placeholder="Search any research topic...",
@@ -473,43 +613,101 @@ def build_app() -> gr.Blocks:
                             variant="primary",
                             scale=1,
                         )
+                        clear_button = gr.Button("Clear", scale=0)
 
                     status_output = gr.Markdown(
                         "Enter a research topic to begin.",
                         elem_classes=["status-line"],
                     )
+                    results_grid = gr.Dataframe(
+                        headers=["#", "Title", "Year", "Source", "Authors", "Citations", "Abstract"],
+                        datatype=["str", "str", "str", "str", "str", "str", "str"],
+                        interactive=False,
+                        wrap=True,
+                        label="Select a paper to summarize",
+                    )
+                    with gr.Row():
+                        load_button = gr.Button("Load Selected Paper")
+                        summarize_selected_button = gr.Button(
+                            "Summarize Selected Paper",
+                            variant="primary",
+                        )
                     results_output = gr.HTML(_render_results_table([]))
 
                     search_button.click(
                         fn=search_all_sources,
                         inputs=query_input,
-                        outputs=[status_output, results_output],
+                        outputs=[
+                            status_output,
+                            results_output,
+                            results_grid,
+                            papers_state,
+                            selected_index_state,
+                        ],
                         show_progress="full",
                     )
                     query_input.submit(
                         fn=search_all_sources,
                         inputs=query_input,
-                        outputs=[status_output, results_output],
+                        outputs=[
+                            status_output,
+                            results_output,
+                            results_grid,
+                            papers_state,
+                            selected_index_state,
+                        ],
                         show_progress="full",
                     )
+                    results_grid.select(
+                        fn=select_result,
+                        outputs=selected_index_state,
+                    )
 
-                with gr.Tab("Summarize"):
-                    source_text = gr.Textbox(
-                        label="Paper text or abstract",
-                        placeholder="Paste an abstract, excerpt, or research notes...",
-                        lines=10,
-                    )
-                    summarize_button = gr.Button("Summarize with AI", variant="primary")
-                    summary_output = gr.Textbox(
-                        label="Summary",
-                        lines=6,
-                        interactive=False,
-                    )
+                with gr.Tab("Summarize", id="summarize"):
+                    with gr.Column(elem_classes=["summarize-panel"]):
+                        load_status_output = gr.Markdown(
+                            "Select a search result or paste text below.",
+                            elem_classes=["status-line"],
+                        )
+                        source_text = gr.Textbox(
+                            label="Paper text or abstract",
+                            placeholder="Paste an abstract, excerpt, or research notes...",
+                            lines=10,
+                        )
+                        summarize_button = gr.Button("Summarize with AI", variant="primary")
+                        summary_output = gr.Textbox(
+                            label="Summary",
+                            lines=8,
+                            interactive=False,
+                        )
                     summarize_button.click(
                         fn=summarize_with_modal,
                         inputs=source_text,
                         outputs=summary_output,
                         show_progress="full",
+                    )
+                    load_button.click(
+                        fn=load_selected_paper,
+                        inputs=[selected_index_state, papers_state],
+                        outputs=[source_text, load_status_output, summary_output, app_tabs],
+                    )
+                    summarize_selected_button.click(
+                        fn=summarize_selected_paper,
+                        inputs=[selected_index_state, papers_state],
+                        outputs=[source_text, load_status_output, summary_output, app_tabs],
+                        show_progress="full",
+                    )
+                    clear_button.click(
+                        fn=clear_search,
+                        outputs=[
+                            status_output,
+                            results_output,
+                            results_grid,
+                            papers_state,
+                            selected_index_state,
+                            source_text,
+                            summary_output,
+                        ],
                     )
 
                 with gr.Tab("About"):
@@ -528,4 +726,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().queue().launch()
+    build_app().queue().launch(server_name="127.0.0.1", server_port=7860)
