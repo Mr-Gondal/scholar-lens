@@ -1,3 +1,15 @@
+---
+title: Scholar Lens
+emoji: 🔬
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+sdk_version: 6.0.0
+app_file: app.py
+pinned: false
+license: mit
+---
+
 # Scholar Lens
 
 Scholar Lens is a Gradio research assistant for searching papers across Semantic Scholar, arXiv, and PubMed from one focused interface. It normalizes results into a clean table, lets users select a paper, and sends the title plus abstract directly to an AI summarizer hosted on Modal.
