@@ -82,3 +82,9 @@ SCHOLAR_LENS_MODAL_TOKEN=your-shared-secret-token
 ```
 
 The Modal endpoints reject requests that do not include the matching `Authorization: Bearer <token>` header.
+
+Input protection:
+
+- Summarization text is capped before it reaches Modal. Longer valid inputs are summarized in bounded chunks, then combined into a final summary.
+- Grounded synthesis uses a fixed context budget so retrieved abstracts cannot overflow the model context window.
+- The app also applies textbox limits in the UI and shows a friendly message when input is too large.

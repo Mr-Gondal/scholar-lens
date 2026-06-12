@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 from typing import Annotated
 
 import modal
@@ -14,6 +15,17 @@ GPU_TYPE = "A100-80GB"
 # Keep the demo context far below the model's 128k maximum so vLLM reserves
 # less KV-cache memory and the endpoint starts more predictably.
 MAX_MODEL_LEN = 32768
+MAX_PROMPT_TOKENS = 24000
+SUMMARY_INPUT_CHAR_LIMIT = 60000
+SUMMARY_INPUT_TOKEN_LIMIT = 15000
+SUMMARY_CHUNK_TOKEN_LIMIT = 3500
+SUMMARY_CHUNK_CHAR_LIMIT = 14000
+SUMMARY_MAX_CHUNKS = 5
+QUESTION_CHAR_LIMIT = 1200
+QUESTION_TOKEN_LIMIT = 300
+SYNTHESIS_CONTEXT_CHAR_LIMIT = 28000
+SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
+TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -56,6 +68,12 @@ class Summarizer:
     def _generate(self, prompt: str, max_new_tokens: int = 300) -> str:
         from vllm import SamplingParams
 
+        prompt_tokens = self._rough_token_count(prompt)
+        if prompt_tokens > MAX_PROMPT_TOKENS:
+            raise ValueError(
+                f"Prompt is too long for this endpoint ({prompt_tokens:,} rough tokens)."
+            )
+
         messages = [{"role": "user", "content": prompt}]
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
@@ -67,6 +85,84 @@ class Summarizer:
             use_tqdm=False,
         )
         return outputs[0].outputs[0].text.strip()
+
+    @staticmethod
+    def _rough_token_count(text: str) -> int:
+        return len(TOKEN_PATTERN.findall(text or ""))
+
+    def _input_limit_error(
+        self,
+        text: str,
+        label: str,
+        max_chars: int,
+        max_tokens: int,
+    ) -> str | None:
+        if len(text) > max_chars:
+            return f"{label} is too long. Keep it under {max_chars:,} characters."
+        token_count = self._rough_token_count(text)
+        if token_count > max_tokens:
+            return (
+                f"{label} is too long. Keep it under roughly {max_tokens:,} "
+                f"tokens; this input is about {token_count:,} tokens."
+            )
+        return None
+
+    def _chunk_summary_text(self, text: str) -> list[str]:
+        chunks: list[str] = []
+        current_words: list[str] = []
+        current_chars = 0
+
+        for word in text.split():
+            proposed_chars = current_chars + len(word) + (1 if current_words else 0)
+            proposed_tokens = len(current_words) + 1
+            if (
+                current_words
+                and (
+                    proposed_chars > SUMMARY_CHUNK_CHAR_LIMIT
+                    or proposed_tokens > SUMMARY_CHUNK_TOKEN_LIMIT
+                )
+            ):
+                chunks.append(" ".join(current_words))
+                current_words = [word]
+                current_chars = len(word)
+            else:
+                current_words.append(word)
+                current_chars = proposed_chars
+
+        if current_words:
+            chunks.append(" ".join(current_words))
+        return chunks[:SUMMARY_MAX_CHUNKS]
+
+    def _summarize_text(self, text: str) -> str:
+        chunks = self._chunk_summary_text(text)
+        if len(chunks) <= 1:
+            prompt = (
+                "Summarize the following research paper abstract in 4-5 clear "
+                "sentences. Focus on the main contribution and the key results.\n\n"
+                f"Abstract:\n{text}"
+            )
+            return self._generate(prompt, max_new_tokens=250)
+
+        chunk_summaries = []
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = (
+                "Summarize this section of a research paper in 2-3 concise "
+                "sentences. Preserve concrete methods, findings, and limitations.\n\n"
+                f"Section {index} of {len(chunks)}:\n{chunk}"
+            )
+            chunk_summaries.append(self._generate(prompt, max_new_tokens=180))
+
+        combined = "\n\n".join(
+            f"Section {index}: {summary}"
+            for index, summary in enumerate(chunk_summaries, start=1)
+        )
+        final_prompt = (
+            "Combine the section summaries below into one coherent 4-6 sentence "
+            "summary of the paper. Avoid repetition and focus on the main "
+            "contribution, methods, results, and limitations.\n\n"
+            f"{combined}"
+        )
+        return self._generate(final_prompt, max_new_tokens=280)
 
     def _require_auth(self, authorization: str | None) -> None:
         expected_token = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
@@ -94,14 +190,18 @@ class Summarizer:
         text = (data or {}).get("text", "")
         if not text:
             return {"error": "No text provided in the request body."}
-
-        prompt = (
-            "Summarize the following research paper abstract in 4-5 clear "
-            "sentences. Focus on the main contribution and the key results.\n\n"
-            f"Abstract:\n{text}"
+        text = text.strip()
+        limit_error = self._input_limit_error(
+            text,
+            "Text",
+            SUMMARY_INPUT_CHAR_LIMIT,
+            SUMMARY_INPUT_TOKEN_LIMIT,
         )
+        if limit_error:
+            return {"error": limit_error}
+
         try:
-            summary = self._generate(prompt, max_new_tokens=250)
+            summary = self._summarize_text(text)
         except Exception as exc:  # surface errors to the client instead of 500s
             return {"error": f"Generation failed: {exc}"}
         return {"summary": summary}
@@ -123,6 +223,24 @@ class Summarizer:
         context = (data or {}).get("context", "")
         if not question or not context:
             return {"error": "Both 'question' and 'context' are required."}
+        question = question.strip()
+        context = context.strip()
+        question_error = self._input_limit_error(
+            question,
+            "Question",
+            QUESTION_CHAR_LIMIT,
+            QUESTION_TOKEN_LIMIT,
+        )
+        if question_error:
+            return {"error": question_error}
+        context_error = self._input_limit_error(
+            context,
+            "Context",
+            SYNTHESIS_CONTEXT_CHAR_LIMIT,
+            SYNTHESIS_CONTEXT_TOKEN_LIMIT,
+        )
+        if context_error:
+            return {"error": context_error}
 
         prompt = (
             "You are a meticulous research assistant. Using ONLY the numbered "

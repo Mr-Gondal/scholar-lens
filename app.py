@@ -27,6 +27,17 @@ SYNTHESIS_PAPER_COUNT = 6
 RESULTS_PER_PAGE = 10
 # Trim very long abstracts so the grounded prompt stays a reasonable size.
 MAX_ABSTRACT_CHARS = 1400
+MAX_ABSTRACT_TOKENS = 350
+SEARCH_QUERY_CHAR_LIMIT = 300
+ASK_QUESTION_CHAR_LIMIT = 1200
+ASK_QUESTION_TOKEN_LIMIT = 300
+SUMMARY_INPUT_CHAR_LIMIT = 60000
+SUMMARY_INPUT_TOKEN_LIMIT = 15000
+SYNTHESIS_CONTEXT_CHAR_LIMIT = 28000
+SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
+DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
+DEFAULT_LOAD_STATUS = "Select a paper to summarize."
+TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,40 @@ class PaperResult:
 def _safe_text(value: Any, fallback: str = "Unknown") -> str:
     text = str(value).strip() if value is not None else ""
     return text or fallback
+
+
+def _rough_token_count(text: str) -> int:
+    return len(TOKEN_PATTERN.findall(text or ""))
+
+
+def _trim_to_budget(text: str, max_chars: int, max_tokens: int) -> str:
+    trimmed = (text or "").strip()
+    if len(trimmed) > max_chars:
+        trimmed = trimmed[:max_chars].rstrip()
+    while _rough_token_count(trimmed) > max_tokens and trimmed:
+        next_length = max(1, int(len(trimmed) * 0.85))
+        trimmed = trimmed[:next_length].rsplit(" ", 1)[0].rstrip()
+    return trimmed
+
+
+def _text_limit_error(
+    text: str,
+    label: str,
+    max_chars: int,
+    max_tokens: int,
+) -> str | None:
+    if len(text) > max_chars:
+        return (
+            f"{label} is too long for this demo. Please keep it under "
+            f"{max_chars:,} characters."
+        )
+    token_count = _rough_token_count(text)
+    if token_count > max_tokens:
+        return (
+            f"{label} is too long for this demo. Please keep it under roughly "
+            f"{max_tokens:,} tokens; this input is about {token_count:,} tokens."
+        )
+    return None
 
 
 def _shorten_authors(authors: list[str], max_authors: int = 3) -> str:
@@ -440,6 +485,16 @@ def search_all_sources(query: str):
             label,
             page,
         )
+    if len(clean_query) > SEARCH_QUERY_CHAR_LIMIT:
+        table, label, page = _page_view([], 0)
+        return (
+            f"Search topic is too long. Please keep it under {SEARCH_QUERY_CHAR_LIMIT} characters.",
+            table,
+            [],
+            gr.update(choices=[], value=None),
+            label,
+            page,
+        )
 
     results, warnings = _collect_results(clean_query)
 
@@ -489,13 +544,22 @@ def _modal_config_error(endpoint_url: str) -> str | None:
 def summarize_with_modal(text: str) -> str:
     if not text or len(text.strip()) < 50:
         return "Please provide a longer abstract or paper text to summarize."
+    clean_text = text.strip()
+    limit_error = _text_limit_error(
+        clean_text,
+        "Paper text",
+        SUMMARY_INPUT_CHAR_LIMIT,
+        SUMMARY_INPUT_TOKEN_LIMIT,
+    )
+    if limit_error:
+        return limit_error
     config_error = _modal_config_error(MODAL_SUMMARIZE_URL)
     if config_error:
         return config_error
     try:
         response = requests.post(
             MODAL_SUMMARIZE_URL,
-            json={"text": text},
+            json={"text": clean_text},
             headers=_modal_headers(),
             timeout=120,
         )
@@ -527,14 +591,23 @@ def _papers_for_synthesis(results: list[PaperResult]) -> list[PaperResult]:
 def _build_synthesis_context(papers: list[PaperResult]) -> str:
     blocks = []
     for index, paper in enumerate(papers, start=1):
-        abstract = paper.abstract.strip()
-        if len(abstract) > MAX_ABSTRACT_CHARS:
-            abstract = abstract[:MAX_ABSTRACT_CHARS].rstrip() + "..."
+        abstract = _trim_to_budget(
+            paper.abstract,
+            MAX_ABSTRACT_CHARS,
+            MAX_ABSTRACT_TOKENS,
+        )
         blocks.append(
             f"[{index}] Title: {paper.title}\n"
             f"Source: {paper.source} ({paper.year})\n"
             f"Abstract: {abstract}"
         )
+        context = "\n\n".join(blocks)
+        if (
+            len(context) > SYNTHESIS_CONTEXT_CHAR_LIMIT
+            or _rough_token_count(context) > SYNTHESIS_CONTEXT_TOKEN_LIMIT
+        ):
+            blocks.pop()
+            break
     return "\n\n".join(blocks)
 
 
@@ -559,6 +632,22 @@ def _render_references(papers: list[PaperResult]) -> str:
 
 
 def synthesize_with_modal(question: str, context: str) -> str:
+    question_limit_error = _text_limit_error(
+        question,
+        "Research question",
+        ASK_QUESTION_CHAR_LIMIT,
+        ASK_QUESTION_TOKEN_LIMIT,
+    )
+    if question_limit_error:
+        return question_limit_error
+    context_limit_error = _text_limit_error(
+        context,
+        "Synthesis context",
+        SYNTHESIS_CONTEXT_CHAR_LIMIT,
+        SYNTHESIS_CONTEXT_TOKEN_LIMIT,
+    )
+    if context_limit_error:
+        return context_limit_error
     config_error = _modal_config_error(MODAL_SYNTHESIZE_URL)
     if config_error:
         return config_error
@@ -593,6 +682,14 @@ def ask_scholar_lens(question: str) -> tuple[str, str]:
     clean_question = question.strip()
     if not clean_question:
         return "Enter a research question to begin.", ""
+    question_limit_error = _text_limit_error(
+        clean_question,
+        "Research question",
+        ASK_QUESTION_CHAR_LIMIT,
+        ASK_QUESTION_TOKEN_LIMIT,
+    )
+    if question_limit_error:
+        return question_limit_error, ""
 
     results, warnings = _collect_results(clean_question)
     if not results:
@@ -611,6 +708,12 @@ def ask_scholar_lens(question: str) -> tuple[str, str]:
         )
 
     context = _build_synthesis_context(papers)
+    if not context:
+        return (
+            "The retrieved abstracts were too large to fit the demo context "
+            "budget. Try a narrower or more specific question.",
+            "",
+        )
     answer = synthesize_with_modal(clean_question, context)
     return answer, _render_references(papers)
 
@@ -702,6 +805,12 @@ def clear_search():
         label,
         page,
         "",
+        "",
+        "",
+        "",
+        DEFAULT_ASK_ANSWER,
+        "",
+        DEFAULT_LOAD_STATUS,
         "",
     )
 
@@ -1011,11 +1120,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             scale=5,
                             container=False,
                             lines=2,
+                            max_length=ASK_QUESTION_CHAR_LIMIT,
                         )
                         ask_button = gr.Button("💬 Ask", variant="primary", scale=1)
 
                     answer_output = gr.Markdown(
-                        "Your grounded, cited answer will appear here.",
+                        DEFAULT_ASK_ANSWER,
                         elem_classes=["answer-card"],
                     )
                     references_output = gr.HTML()
@@ -1040,6 +1150,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             placeholder="Enter research topic (e.g., 'Quantum computing in drug discovery')",
                             scale=5,
                             container=False,
+                            max_length=SEARCH_QUERY_CHAR_LIMIT,
                         )
                         search_button = gr.Button("🔍 Search", variant="primary", scale=1)
                         with gr.Column(scale=0, min_width=100, elem_classes=["btn-crimson"]):
@@ -1109,8 +1220,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
 
                 with gr.Tab("✨  Summarize", id="summarize"):
                     with gr.Column(elem_classes=["summarize-panel"]):
-                        load_status_output = gr.Markdown("Select a paper to summarize.")
-                        source_text = gr.Textbox(label="Paper Context", lines=10)
+                        load_status_output = gr.Markdown(DEFAULT_LOAD_STATUS)
+                        source_text = gr.Textbox(
+                            label="Paper Context",
+                            lines=10,
+                            max_length=SUMMARY_INPUT_CHAR_LIMIT,
+                        )
                         summarize_button = gr.Button("✨ Summarize with AI", variant="primary")
                         summary_output = gr.Textbox(label="AI Synthesis", lines=8, interactive=False)
 
@@ -1183,6 +1298,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     page_state,
                     source_text,
                     summary_output,
+                    query_input,
+                    question_input,
+                    answer_output,
+                    references_output,
+                    load_status_output,
+                    hidden_selected_index,
                 ],
             )
 
