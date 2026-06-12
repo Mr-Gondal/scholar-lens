@@ -971,8 +971,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                 with gr.Tab("💬  Ask", id="ask"):
                     gr.Markdown(
                         "Ask a research question. Scholar Lens searches **OpenAlex, "
-                        "Crossref, arXiv, and PubMed**, then a small open model "
-                        "(Qwen2.5-7B) writes a synthesized, **cited** answer grounded "
+                        "Crossref, arXiv, and PubMed**, then a 24B open model "
+                        "(Mistral Small 3.1) writes a synthesized, **cited** answer grounded "
                         "only in the retrieved abstracts.",
                         elem_classes=["ask-intro"],
                     )
@@ -1126,8 +1126,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             <p>
                                 It performs real-time searches across <strong>OpenAlex</strong>,
                                 <strong>Crossref</strong>, <strong>arXiv</strong>, and <strong>PubMed</strong>
-                                using parallel processing, then uses a small open language model
-                                (<strong>Qwen2.5-7B</strong>, hosted on Modal) to do the heavy lifting.
+                                using parallel processing, then uses a 24B open language model
+                                (<strong>Mistral Small 3.1</strong>, hosted on Modal) to do the heavy lifting.
                             </p>
                             <p>
                                 In the <strong>Ask</strong> tab the model answers your research

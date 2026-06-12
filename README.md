@@ -12,11 +12,11 @@ license: mit
 
 # Scholar Lens
 
-Scholar Lens is a Gradio research assistant for searching papers across OpenAlex, Crossref, arXiv, and PubMed from one focused interface. It normalizes and de-duplicates results into a clean table, lets users select a paper, and sends the title plus abstract to a small open language model (Qwen2.5-7B) hosted on Modal.
+Scholar Lens is a Gradio research assistant for searching papers across OpenAlex, Crossref, arXiv, and PubMed from one focused interface. It normalizes and de-duplicates results into a clean table, lets users select a paper, and sends the title plus abstract to a strong open language model (Mistral Small 3.1 24B) hosted on Modal.
 
 ## Features
 
-- **Ask (grounded Q&A):** ask a research question; the app searches all four sources and a small open model writes a synthesized, **cited** answer grounded only in the retrieved abstracts (no invented sources).
+- **Ask (grounded Q&A):** ask a research question; the app searches all four sources and a 24B open model writes a synthesized, **cited** answer grounded only in the retrieved abstracts (no invented sources).
 - Search OpenAlex, Crossref, arXiv, and PubMed with one query.
 - De-duplicates results across sources by DOI, then normalized title.
 - View normalized paper metadata: title, year, source, authors, citations, and abstract availability.
@@ -57,7 +57,7 @@ The app launches a local Gradio server and prints the URL in the terminal.
 
 ## Modal Inference
 
-`modal_inference.py` defines a Modal class backed by `Qwen/Qwen2.5-7B-Instruct` (a small, ≤32B open model). The model is loaded once per container via `@modal.enter()` and kept warm, then exposed through two FastAPI endpoints:
+`modal_inference.py` defines a Modal class backed by `mistralai/Mistral-Small-3.1-24B-Instruct-2503` (a 24B, <=32B open model). The model is loaded once per container via `@modal.enter()` and kept warm briefly for demos, then exposed through two FastAPI endpoints:
 
 - `summarize_paper` — condenses a single abstract or pasted text (`MODAL_SUMMARIZE_URL`).
 - `synthesize` — answers a question grounded in numbered abstracts, with `[n]` citations (`MODAL_SYNTHESIZE_URL`).

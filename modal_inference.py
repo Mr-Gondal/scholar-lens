@@ -2,15 +2,17 @@ import modal
 
 app = modal.App("scholar-lens-summarizer")
 
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+GPU_TYPE = "A100-80GB"
+# Keep the demo context far below the model's 128k maximum so vLLM reserves
+# less KV-cache memory and the endpoint starts more predictably.
+MAX_MODEL_LEN = 32768
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch==2.4.1",
-        "transformers==4.45.2",
-        "accelerate==0.34.2",
-        "bitsandbytes==0.44.1",
+        "vllm>=0.8.1",
+        "mistral_common>=1.5.4",
         "fastapi[standard]",
     )
 )
@@ -18,57 +20,43 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="A100",
+    # Mistral Small 3.1 24B needs substantial VRAM in bf16/fp16. Use this
+    # only for short judge demos, then move back down when the review is over.
+    gpu=GPU_TYPE,
     timeout=300,
-    # Keep the container (and the loaded model) warm for 5 minutes after the
-    # last request so repeat calls don't pay the cold-start cost again.
-    scaledown_window=300,
+    # Keep warm briefly for live demos without leaving an expensive GPU idle.
+    scaledown_window=90,
     secrets=[modal.Secret.from_name("huggingface")],
 )
 class Summarizer:
     @modal.enter()
     def load_model(self) -> None:
         """Load the model and tokenizer ONCE per container, not per request."""
-        import torch
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            BitsAndBytesConfig,
-        )
+        from vllm import LLM
 
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            quantization_config=quant_config,
-            device_map="auto",
+        self.model = LLM(
+            model=MODEL_NAME,
+            tokenizer_mode="mistral",
+            config_format="mistral",
+            load_format="mistral",
+            max_model_len=MAX_MODEL_LEN,
+            gpu_memory_utilization=0.90,
         )
 
     def _generate(self, prompt: str, max_new_tokens: int = 300) -> str:
-        import torch
+        from vllm import SamplingParams
 
         messages = [{"role": "user", "content": prompt}]
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.15,
         )
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        # Decode only the newly generated tokens (avoids fragile string splitting).
-        generated = outputs[0][inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        outputs = self.model.chat(
+            messages,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        return outputs[0].outputs[0].text.strip()
 
     @modal.fastapi_endpoint(method="POST", label="scholar-lens-summarizer-summarize-paper")
     def summarize_paper(self, data: dict) -> dict:
