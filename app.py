@@ -4,6 +4,7 @@ import html
 import os
 import re
 import textwrap
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ import requests
 APP_TITLE = "Scholar Lens"
 SEARCH_LIMIT_PER_SOURCE = 10
 REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SECONDS = 0.6
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 # Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
 # reliable responses. Replace with your own email if you like.
 CONTACT_EMAIL = "hussainharis946@gmail.com"
@@ -38,6 +42,41 @@ SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
 DEFAULT_LOAD_STATUS = "Select a paper to summarize."
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
+SEARCH_STOPWORDS = {
+    "a",
+    "about",
+    "and",
+    "are",
+    "as",
+    "be",
+    "being",
+    "between",
+    "by",
+    "can",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "main",
+    "of",
+    "on",
+    "or",
+    "recent",
+    "show",
+    "the",
+    "their",
+    "these",
+    "to",
+    "used",
+    "using",
+    "what",
+    "where",
+    "which",
+    "with",
+}
 
 
 @dataclass(frozen=True)
@@ -91,6 +130,63 @@ def _text_limit_error(
     return None
 
 
+def _search_terms(query: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9-]{2,}", query.lower())
+    terms: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        if word in SEARCH_STOPWORDS or word in seen:
+            continue
+        seen.add(word)
+        terms.append(word)
+    return terms
+
+
+def _extract_search_query(question: str) -> str:
+    terms = _search_terms(question)
+    if not terms:
+        return question.strip()
+    return " ".join(terms[:8])
+
+
+def _year_value(item: PaperResult) -> int:
+    return int(item.year) if item.year.isdigit() else 0
+
+
+def _citation_value(item: PaperResult) -> int:
+    return int(item.citations) if item.citations.isdigit() else 0
+
+
+def _relevance_score(item: PaperResult, query: str) -> int:
+    terms = _search_terms(query)
+    if not terms:
+        return 0
+    title = item.title.lower()
+    abstract = item.abstract.lower()
+    authors = item.authors.lower()
+    score = 0
+    for term in terms:
+        if term in title:
+            score += 8
+        if term in abstract:
+            score += 3
+        if term in authors:
+            score += 1
+    return score
+
+
+def _rank_results(results: list[PaperResult], query: str) -> list[PaperResult]:
+    return sorted(
+        results,
+        key=lambda item: (
+            _relevance_score(item, query),
+            _year_value(item),
+            min(_citation_value(item), 5000),
+        ),
+        reverse=True,
+    )
+
+
 def _shorten_authors(authors: list[str], max_authors: int = 3) -> str:
     clean_authors = [author.strip() for author in authors if author and author.strip()]
     if not clean_authors:
@@ -106,16 +202,45 @@ def _extract_year(date_value: Any) -> str:
     return match.group(0) if match else "Unknown"
 
 
+def _get_with_retries(
+    url: str,
+    params: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    request_headers = {
+        "User-Agent": "ScholarLens/1.0 (academic search app)",
+        **(headers or {}),
+    }
+    last_error: requests.RequestException | None = None
+    for attempt in range(REQUEST_RETRY_ATTEMPTS):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                headers=request_headers,
+            )
+            if response.status_code not in RETRY_STATUS_CODES:
+                response.raise_for_status()
+                return response
+            last_error = requests.HTTPError(
+                f"{response.status_code} response from {url}",
+                response=response,
+            )
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            last_error = exc
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code not in RETRY_STATUS_CODES:
+                raise
+        if attempt < REQUEST_RETRY_ATTEMPTS - 1:
+            time.sleep(REQUEST_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    if last_error:
+        raise last_error
+    raise requests.RequestException(f"Request failed for {url}")
+
+
 def _request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
-    response = requests.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-            "Accept": "application/json",
-        },
-    )
+    response = _get_with_retries(url, params, headers={"Accept": "application/json"})
     response.raise_for_status()
     return response.json()
 
@@ -233,7 +358,7 @@ def search_arxiv(query: str) -> tuple[list[PaperResult], str | None]:
         "sortOrder": "descending",
     }
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = _get_with_retries(url, params)
         response.raise_for_status()
         root = ET.fromstring(response.text)
     except (requests.RequestException, ET.ParseError):
@@ -310,14 +435,13 @@ def _fetch_pubmed_abstracts(paper_ids: list[str]) -> dict[str, str]:
     if not paper_ids:
         return {}
     fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-    response = requests.get(
+    response = _get_with_retries(
         fetch_url,
         params={
             "db": "pubmed",
             "id": ",".join(paper_ids),
             "retmode": "xml",
         },
-        timeout=REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     root = ET.fromstring(response.text)
@@ -417,6 +541,15 @@ def _page_view(results: list[PaperResult], page: int) -> tuple[str, str, int]:
     return table, label, page
 
 
+def _pagination_updates(results: list[PaperResult], page: int) -> tuple[gr.Button, gr.Button]:
+    total_pages = max(1, (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+    has_results = bool(results)
+    return (
+        gr.update(interactive=has_results and page > 0),
+        gr.update(interactive=has_results and page < total_pages - 1),
+    )
+
+
 def _dedupe_results(results: list[PaperResult]) -> list[PaperResult]:
     """Drop duplicate papers that appear in more than one source.
 
@@ -442,7 +575,7 @@ def _dedupe_results(results: list[PaperResult]) -> list[PaperResult]:
 
 
 def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
-    """Query every source in parallel, then de-duplicate and sort by year."""
+    """Query every source in parallel, then de-duplicate and rank results."""
     search_functions = [search_openalex, search_crossref, search_arxiv, search_pubmed]
     results: list[PaperResult] = []
     warnings: list[str] = []
@@ -460,13 +593,7 @@ def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
 
     results = _dedupe_results(results)
 
-    def _sort_key(item: PaperResult) -> tuple[int, int]:
-        if item.year == "Unknown" or not item.year.isdigit():
-            return (0, 0)
-        return (1, int(item.year))
-
-    results.sort(key=_sort_key, reverse=True)
-    return results, warnings
+    return _rank_results(results, query), warnings
 
 
 def _selector_choices(results: list[PaperResult]) -> list[str]:
@@ -477,6 +604,7 @@ def search_all_sources(query: str):
     clean_query = query.strip()
     if not clean_query:
         table, label, page = _page_view([], 0)
+        prev_update, next_update = _pagination_updates([], page)
         return (
             "Enter a research topic to search OpenAlex, Crossref, arXiv, and PubMed.",
             table,
@@ -484,9 +612,12 @@ def search_all_sources(query: str):
             gr.update(choices=[], value=None),
             label,
             page,
+            prev_update,
+            next_update,
         )
     if len(clean_query) > SEARCH_QUERY_CHAR_LIMIT:
         table, label, page = _page_view([], 0)
+        prev_update, next_update = _pagination_updates([], page)
         return (
             f"Search topic is too long. Please keep it under {SEARCH_QUERY_CHAR_LIMIT} characters.",
             table,
@@ -494,6 +625,8 @@ def search_all_sources(query: str):
             gr.update(choices=[], value=None),
             label,
             page,
+            prev_update,
+            next_update,
         )
 
     results, warnings = _collect_results(clean_query)
@@ -509,6 +642,7 @@ def search_all_sources(query: str):
         status = "No papers found. Try a broader research topic or a different phrase."
 
     table, label, page = _page_view(results, 0)
+    prev_update, next_update = _pagination_updates(results, page)
     return (
         status,
         table,
@@ -516,11 +650,15 @@ def search_all_sources(query: str):
         gr.update(choices=_selector_choices(results), value=None),
         label,
         page,
+        prev_update,
+        next_update,
     )
 
 
-def change_page(results: list[PaperResult], page: int, delta: int) -> tuple[str, str, int]:
-    return _page_view(results, (page or 0) + delta)
+def change_page(results: list[PaperResult], page: int, delta: int):
+    table, label, clamped_page = _page_view(results, (page or 0) + delta)
+    prev_update, next_update = _pagination_updates(results, clamped_page)
+    return table, label, clamped_page, prev_update, next_update
 
 
 def _modal_headers() -> dict[str, str]:
@@ -691,7 +829,8 @@ def ask_scholar_lens(question: str) -> tuple[str, str]:
     if question_limit_error:
         return question_limit_error, ""
 
-    results, warnings = _collect_results(clean_question)
+    search_query = _extract_search_query(clean_question)
+    results, warnings = _collect_results(search_query)
     if not results:
         note = " ".join(warnings) if warnings else ""
         return (
@@ -797,6 +936,7 @@ def summarize_row_selection(
 
 def clear_search():
     table, label, page = _page_view([], 0)
+    prev_update, next_update = _pagination_updates([], page)
     return (
         "Enter a research topic to begin.",
         table,
@@ -804,6 +944,8 @@ def clear_search():
         gr.update(choices=[], value=None),
         label,
         page,
+        prev_update,
+        next_update,
         "",
         "",
         "",
@@ -940,9 +1082,10 @@ CUSTOM_CSS = """
     border: 1px solid var(--sl-border);
     border-radius: 12px;
     background: var(--sl-panel);
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
-.results-table { width: 100%; border-collapse: collapse; }
+.results-table { width: 100%; min-width: 860px; border-collapse: collapse; }
 .results-table th {
     background: var(--sl-bg-deep);
     color: var(--sl-accent-bright) !important;
@@ -1160,9 +1303,9 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     results_output = gr.HTML(_render_results_table([]))
 
                     with gr.Row(elem_classes=["page-row"]):
-                        prev_button = gr.Button("← Prev", scale=0, min_width=100)
+                        prev_button = gr.Button("← Prev", scale=0, min_width=100, interactive=False)
                         page_label = gr.Markdown("", elem_classes=["page-label"])
-                        next_button = gr.Button("Next →", scale=0, min_width=100)
+                        next_button = gr.Button("Next →", scale=0, min_width=100, interactive=False)
 
                     with gr.Row(elem_classes=["action-row"]):
                         paper_selector = gr.Dropdown(
@@ -1182,6 +1325,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         paper_selector,
                         page_label,
                         page_state,
+                        prev_button,
+                        next_button,
                     ]
                     search_button.click(
                         fn=search_all_sources,
@@ -1199,12 +1344,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     prev_button.click(
                         fn=lambda results, page: change_page(results, page, -1),
                         inputs=[papers_state, page_state],
-                        outputs=[results_output, page_label, page_state],
+                        outputs=[results_output, page_label, page_state, prev_button, next_button],
                     )
                     next_button.click(
                         fn=lambda results, page: change_page(results, page, 1),
                         inputs=[papers_state, page_state],
-                        outputs=[results_output, page_label, page_state],
+                        outputs=[results_output, page_label, page_state, prev_button, next_button],
                     )
 
                     hidden_selected_index = gr.Textbox(
@@ -1296,6 +1441,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     paper_selector,
                     page_label,
                     page_state,
+                    prev_button,
+                    next_button,
                     source_text,
                     summary_output,
                     query_input,

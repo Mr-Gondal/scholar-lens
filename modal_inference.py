@@ -203,7 +203,8 @@ class Summarizer:
         try:
             summary = self._summarize_text(text)
         except Exception as exc:  # surface errors to the client instead of 500s
-            return {"error": f"Generation failed: {exc}"}
+            print(f"summarize_paper generation failed: {exc}")
+            return {"error": "Generation failed. Please try again shortly."}
         return {"summary": summary}
 
     @modal.fastapi_endpoint(method="POST", label="scholar-lens-summarizer-synthesize")
@@ -257,5 +258,6 @@ class Summarizer:
         try:
             answer = self._generate(prompt, max_new_tokens=450)
         except Exception as exc:
-            return {"error": f"Generation failed: {exc}"}
+            print(f"synthesize generation failed: {exc}")
+            return {"error": "Generation failed. Please try again shortly."}
         return {"answer": answer}
