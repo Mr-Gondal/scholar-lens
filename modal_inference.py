@@ -189,7 +189,10 @@ class Summarizer:
         self._require_auth(authorization)
         text = (data or {}).get("text", "")
         if not text:
-            return {"error": "No text provided in the request body."}
+            raise HTTPException(
+                status_code=400,
+                detail="No text provided in the request body.",
+            )
         text = text.strip()
         limit_error = self._input_limit_error(
             text,
@@ -198,7 +201,7 @@ class Summarizer:
             SUMMARY_INPUT_TOKEN_LIMIT,
         )
         if limit_error:
-            return {"error": limit_error}
+            raise HTTPException(status_code=400, detail=limit_error)
 
         try:
             summary = self._summarize_text(text)
@@ -223,7 +226,10 @@ class Summarizer:
         question = (data or {}).get("question", "")
         context = (data or {}).get("context", "")
         if not question or not context:
-            return {"error": "Both 'question' and 'context' are required."}
+            raise HTTPException(
+                status_code=400,
+                detail="Both 'question' and 'context' are required.",
+            )
         question = question.strip()
         context = context.strip()
         question_error = self._input_limit_error(
@@ -233,7 +239,7 @@ class Summarizer:
             QUESTION_TOKEN_LIMIT,
         )
         if question_error:
-            return {"error": question_error}
+            raise HTTPException(status_code=400, detail=question_error)
         context_error = self._input_limit_error(
             context,
             "Context",
@@ -241,7 +247,7 @@ class Summarizer:
             SYNTHESIS_CONTEXT_TOKEN_LIMIT,
         )
         if context_error:
-            return {"error": context_error}
+            raise HTTPException(status_code=400, detail=context_error)
 
         prompt = (
             "You are a meticulous research assistant. Using ONLY the numbered "

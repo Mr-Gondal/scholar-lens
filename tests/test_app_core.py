@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import app
 
@@ -65,12 +66,14 @@ class AppCoreTests(unittest.TestCase):
     def test_clear_search_returns_all_reset_outputs(self):
         result = app.clear_search()
 
-        self.assertEqual(len(result), 16)
+        self.assertEqual(len(result), 19)
         self.assertEqual(result[0], "Enter a research topic to begin.")
+        self.assertIsNone(result[9])
         self.assertEqual(result[10], "")
         self.assertEqual(result[11], "")
-        self.assertEqual(result[12], app.DEFAULT_ASK_ANSWER)
-        self.assertEqual(result[14], app.DEFAULT_LOAD_STATUS)
+        self.assertEqual(result[14], app.DEFAULT_ASK_ANSWER)
+        self.assertEqual(result[16], app.DEFAULT_LOAD_STATUS)
+        self.assertIsNone(result[18])
 
     def test_pagination_updates_disable_edges(self):
         papers = [paper(f"Paper {index}") for index in range(app.RESULTS_PER_PAGE + 1)]
@@ -82,6 +85,65 @@ class AppCoreTests(unittest.TestCase):
         self.assertTrue(first_next["interactive"])
         self.assertTrue(second_prev["interactive"])
         self.assertFalse(second_next["interactive"])
+
+    def test_reconstruct_abstract_orders_openalex_index(self):
+        abstract = app._reconstruct_abstract({"world": [1], "hello": [0]})
+
+        self.assertEqual(abstract, "hello world")
+
+    def test_normalize_doi_strips_doi_url(self):
+        self.assertEqual(
+            app._normalize_doi("https://doi.org/10.1234/ABC"),
+            "10.1234/abc",
+        )
+
+    def test_dedupe_prefers_duplicate_with_abstract(self):
+        weak = paper("Deep Learning for Cancer Detection", abstract="")
+        strong = paper(
+            "Deep Learning for Cancer Detection!",
+            abstract="Detailed abstract",
+            citations="3",
+        )
+
+        deduped = app._dedupe_results([weak, strong])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].abstract, "Detailed abstract")
+
+    def test_source_specific_queries(self):
+        self.assertIn("ti:cancer", app._arxiv_search_query("cancer detection with MRI"))
+        self.assertIn(
+            "cancer[Title/Abstract]",
+            app._pubmed_search_query("cancer detection with MRI"),
+        )
+
+    def test_load_selected_paper_returns_context(self):
+        item = paper("Useful Paper", abstract="A clear abstract about useful results.")
+
+        paper_text, status, summary, tab_update = app.load_selected_paper(0, [item])
+
+        self.assertIn("Useful Paper", paper_text)
+        self.assertIn("Loaded", status)
+        self.assertEqual(summary, "")
+        self.assertEqual(tab_update["selected"], "summarize")
+
+    def test_export_results_csv_creates_file(self):
+        path = app.export_results_csv([paper("Exportable Paper")])
+
+        self.assertIsNotNone(path)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn("Exportable Paper", content)
+
+    def test_modal_request_error_uses_response_detail(self):
+        response = Mock()
+        response.json.return_value = {"detail": "Bad input"}
+        exc = app.requests.HTTPError(response=response)
+
+        self.assertEqual(
+            app._modal_request_error_message(exc, "Modal"),
+            "Modal: Bad input",
+        )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ Scholar Lens is a Gradio research assistant for searching papers across OpenAlex
 - View normalized paper metadata: title, year, source, authors, citations, and abstract availability.
 - Select a search result and load it into the Summarize tab.
 - Summarize selected papers or pasted abstracts with a Modal-hosted language model.
+- View search insight cards, evidence snippets, and export results or summaries.
 - Professional dark Gradio interface with responsive result tables and source badges.
 
 ## Codex Track
@@ -55,6 +56,21 @@ python app.py
 
 The app launches a local Gradio server and prints the URL in the terminal.
 
+Optional local configuration:
+
+```bash
+set SCHOLAR_LENS_CONTACT_EMAIL=you@example.com
+set MODAL_SUMMARIZE_URL=https://your-summarize-endpoint.modal.run
+set MODAL_SYNTHESIZE_URL=https://your-synthesize-endpoint.modal.run
+set SCHOLAR_LENS_MODAL_TOKEN=your-shared-secret-token
+```
+
+Run tests:
+
+```bash
+python -B -m unittest discover -s tests -v
+```
+
 ## Modal Inference
 
 `modal_inference.py` defines a Modal class backed by `mistralai/Mistral-Small-3.1-24B-Instruct-2503` (a 24B, <=32B open model). The model is loaded once per container via `@modal.enter()` and kept warm briefly for demos, then exposed through two FastAPI endpoints:
@@ -79,6 +95,7 @@ After deployment, set these Gradio/Hugging Face Space environment variables to t
 MODAL_SUMMARIZE_URL=https://your-summarize-endpoint.modal.run
 MODAL_SYNTHESIZE_URL=https://your-synthesize-endpoint.modal.run
 SCHOLAR_LENS_MODAL_TOKEN=your-shared-secret-token
+SCHOLAR_LENS_CONTACT_EMAIL=you@example.com
 ```
 
 The Modal endpoints reject requests that do not include the matching `Authorization: Bearer <token>` header.

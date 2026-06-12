@@ -3,11 +3,16 @@ from __future__ import annotations
 import html
 import os
 import re
+import csv
 import textwrap
 import time
+import tempfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -21,7 +26,7 @@ REQUEST_RETRY_BACKOFF_SECONDS = 0.6
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 # Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
 # reliable responses. Replace with your own email if you like.
-CONTACT_EMAIL = "hussainharis946@gmail.com"
+CONTACT_EMAIL = os.getenv("SCHOLAR_LENS_CONTACT_EMAIL", "hussainharis946@gmail.com").strip()
 MODAL_SUMMARIZE_URL = os.getenv("MODAL_SUMMARIZE_URL", "").strip()
 MODAL_SYNTHESIZE_URL = os.getenv("MODAL_SYNTHESIZE_URL", "").strip()
 MODAL_API_TOKEN = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
@@ -42,6 +47,14 @@ SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
 DEFAULT_LOAD_STATUS = "Select a paper to summarize."
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
+FUZZY_TITLE_THRESHOLD = 0.94
+EXPORT_DIR = Path(tempfile.gettempdir()) / "scholar-lens-exports"
+SAMPLE_QUESTIONS = [
+    "How is AI being used for early cancer detection?",
+    "What are recent methods for battery degradation prediction?",
+    "Where do papers disagree on retrieval-augmented generation?",
+    "What are the main approaches to early Alzheimer's detection from MRI?",
+]
 SEARCH_STOPWORDS = {
     "a",
     "about",
@@ -185,6 +198,117 @@ def _rank_results(results: list[PaperResult], query: str) -> list[PaperResult]:
         ),
         reverse=True,
     )
+
+
+def _arxiv_search_query(query: str) -> str:
+    terms = _search_terms(query)[:6]
+    if not terms:
+        return f"all:{query}"
+    return " OR ".join(f"ti:{term} OR abs:{term}" for term in terms)
+
+
+def _pubmed_search_query(query: str) -> str:
+    terms = _search_terms(query)[:8]
+    if not terms:
+        return query
+    return " OR ".join(f'{term}[Title/Abstract]' for term in terms)
+
+
+def _result_quality(result: PaperResult) -> tuple[int, int, int]:
+    return (
+        1 if result.abstract.strip() else 0,
+        _citation_value(result),
+        _year_value(result),
+    )
+
+
+def _titles_match(left: str, right: str) -> bool:
+    left_key = re.sub(r"[^a-z0-9]+", "", left.lower())
+    right_key = re.sub(r"[^a-z0-9]+", "", right.lower())
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    return SequenceMatcher(None, left_key, right_key).ratio() >= FUZZY_TITLE_THRESHOLD
+
+
+def _render_result_insights(results: list[PaperResult]) -> str:
+    if not results:
+        return ""
+
+    source_counts = Counter(result.source for result in results)
+    years = [_year_value(result) for result in results if _year_value(result)]
+    year_range = f"{min(years)}-{max(years)}" if years else "Unknown"
+    abstracts = sum(1 for result in results if result.abstract.strip())
+    top_source, top_source_count = source_counts.most_common(1)[0]
+    cards = [
+        ("Papers", f"{len(results)}", "Deduplicated results"),
+        ("Sources", f"{len(source_counts)}", ", ".join(sorted(source_counts))),
+        ("Year Range", year_range, "Publication years"),
+        ("Abstracts", f"{abstracts}", "Ready for AI grounding"),
+        ("Top Source", top_source, f"{top_source_count} papers"),
+    ]
+    rendered_cards = "".join(
+        f'<div class="insight-card"><span>{html.escape(label)}</span>'
+        f"<strong>{html.escape(value)}</strong><small>{html.escape(detail)}</small></div>"
+        for label, value, detail in cards
+    )
+    return f'<div class="insight-grid">{rendered_cards}</div>'
+
+
+def _abstract_snippet(text: str, max_chars: int = 220) -> str:
+    snippet = " ".join((text or "").split())
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars].rsplit(" ", 1)[0].rstrip() + "..."
+    return snippet
+
+
+def _ensure_export_dir() -> Path:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return EXPORT_DIR
+
+
+def export_results_csv(results: list[PaperResult]) -> str | None:
+    if not results:
+        return None
+    path = _ensure_export_dir() / "scholar_lens_results.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["title", "year", "source", "authors", "citations", "url", "doi", "abstract"])
+        for result in results:
+            writer.writerow(
+                [
+                    result.title,
+                    result.year,
+                    result.source,
+                    result.authors,
+                    result.citations,
+                    result.url,
+                    result.doi,
+                    result.abstract,
+                ]
+            )
+    return str(path)
+
+
+def export_summary_markdown(source_text: str, summary: str) -> str | None:
+    if not source_text.strip() and not summary.strip():
+        return None
+    path = _ensure_export_dir() / "scholar_lens_summary.md"
+    path.write_text(
+        "# Scholar Lens Summary\n\n"
+        "## Source Context\n\n"
+        f"{source_text.strip() or '_No source context provided._'}\n\n"
+        "## AI Summary\n\n"
+        f"{summary.strip() or '_No summary generated yet._'}\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def ask_example(question: str) -> tuple[str, str, str]:
+    answer, references = ask_scholar_lens(question)
+    return question, answer, references
 
 
 def _shorten_authors(authors: list[str], max_authors: int = 3) -> str:
@@ -351,7 +475,7 @@ def search_crossref(query: str) -> tuple[list[PaperResult], str | None]:
 def search_arxiv(query: str) -> tuple[list[PaperResult], str | None]:
     url = "https://export.arxiv.org/api/query"
     params = {
-        "search_query": f"all:{query}",
+        "search_query": _arxiv_search_query(query),
         "start": 0,
         "max_results": SEARCH_LIMIT_PER_SOURCE,
         "sortBy": "relevance",
@@ -394,7 +518,7 @@ def search_pubmed(query: str) -> tuple[list[PaperResult], str | None]:
     summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
     search_params = {
         "db": "pubmed",
-        "term": query,
+        "term": _pubmed_search_query(query),
         "retmode": "json",
         "retmax": SEARCH_LIMIT_PER_SOURCE,
         "sort": "relevance",
@@ -505,7 +629,7 @@ def _render_results_table(results: list[PaperResult], start_index: int = 0) -> s
                     <td>{_source_badge(result.source)}</td>
                     <td class="authors-cell">{html.escape(result.authors)}</td>
                     <td class="citation-cell">{html.escape(result.citations)}</td>
-                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Open ↗</a></td>
+                    <td class="action-cell"><span class="row-action">Summarize</span><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Open ↗</a></td>
                 </tr>
                 """
             ).strip()
@@ -521,7 +645,7 @@ def _render_results_table(results: list[PaperResult], start_index: int = 0) -> s
                     <th>Source</th>
                     <th>Authors</th>
                     <th>Cites</th>
-                    <th>Link</th>
+                    <th>Action</th>
                 </tr>
             </thead>
             <tbody>{''.join(rows)}</tbody>
@@ -553,24 +677,30 @@ def _pagination_updates(results: list[PaperResult], page: int) -> tuple[gr.Butto
 def _dedupe_results(results: list[PaperResult]) -> list[PaperResult]:
     """Drop duplicate papers that appear in more than one source.
 
-    Papers are matched on a normalized title; the first occurrence wins so we
-    keep the source order produced by the search functions.
+    DOI wins first, then fuzzy title matching. When duplicates are found, keep
+    the version with the strongest metadata rather than whichever API returned
+    first.
     """
-    seen_dois: set[str] = set()
-    seen_titles: set[str] = set()
     unique: list[PaperResult] = []
     for result in results:
         doi = _normalize_doi(result.doi)
-        if doi and doi in seen_dois:
+        duplicate_index = None
+        for index, existing in enumerate(unique):
+            existing_doi = _normalize_doi(existing.doi)
+            if doi and existing_doi and doi == existing_doi:
+                duplicate_index = index
+                break
+            if _titles_match(result.title, existing.title):
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            unique.append(result)
             continue
-        title_key = re.sub(r"[^a-z0-9]+", "", result.title.lower())
-        if title_key and title_key in seen_titles:
-            continue
-        if doi:
-            seen_dois.add(doi)
-        if title_key:
-            seen_titles.add(title_key)
-        unique.append(result)
+
+        existing = unique[duplicate_index]
+        if _result_quality(result) > _result_quality(existing):
+            unique[duplicate_index] = result
     return unique
 
 
@@ -608,12 +738,14 @@ def search_all_sources(query: str):
         return (
             "Enter a research topic to search OpenAlex, Crossref, arXiv, and PubMed.",
             table,
+            "",
             [],
             gr.update(choices=[], value=None),
             label,
             page,
             prev_update,
             next_update,
+            None,
         )
     if len(clean_query) > SEARCH_QUERY_CHAR_LIMIT:
         table, label, page = _page_view([], 0)
@@ -621,12 +753,14 @@ def search_all_sources(query: str):
         return (
             f"Search topic is too long. Please keep it under {SEARCH_QUERY_CHAR_LIMIT} characters.",
             table,
+            "",
             [],
             gr.update(choices=[], value=None),
             label,
             page,
             prev_update,
             next_update,
+            None,
         )
 
     results, warnings = _collect_results(clean_query)
@@ -643,15 +777,18 @@ def search_all_sources(query: str):
 
     table, label, page = _page_view(results, 0)
     prev_update, next_update = _pagination_updates(results, page)
+    results_csv = export_results_csv(results) if results else None
     return (
         status,
         table,
+        _render_result_insights(results),
         results,
         gr.update(choices=_selector_choices(results), value=None),
         label,
         page,
         prev_update,
         next_update,
+        results_csv,
     )
 
 
@@ -677,6 +814,19 @@ def _modal_config_error(endpoint_url: str) -> str | None:
             "SCHOLAR_LENS_MODAL_TOKEN before using this feature."
         )
     return None
+
+
+def _modal_request_error_message(exc: requests.RequestException, label: str) -> str:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        detail = payload.get("detail") or payload.get("error")
+        if detail:
+            return f"{label}: {detail}"
+    return f"{label} is unavailable right now. Please try again shortly."
 
 
 def summarize_with_modal(text: str) -> str:
@@ -707,8 +857,8 @@ def summarize_with_modal(text: str) -> str:
             "The AI summarizer timed out (the model may be cold-starting). "
             "Please try again in a few seconds."
         )
-    except requests.RequestException:
-        return "The AI summarizer is unavailable right now. Please try again shortly."
+    except requests.RequestException as exc:
+        return _modal_request_error_message(exc, "The AI summarizer")
 
     try:
         payload = response.json()
@@ -755,12 +905,14 @@ def _render_references(papers: list[PaperResult]) -> str:
     items = []
     for index, paper in enumerate(papers, start=1):
         safe_url = html.escape(paper.url, quote=True)
+        snippet = _abstract_snippet(paper.abstract)
         items.append(
             f'<li class="ref-item">'
             f'<span class="ref-num">[{index}]</span>'
             f'<span class="ref-body">'
             f'<a class="ref-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(paper.title)}</a>'
             f'<span class="ref-meta">{_source_badge(paper.source)} · {html.escape(paper.year)} · {html.escape(paper.authors)}</span>'
+            f'<span class="ref-snippet">{html.escape(snippet)}</span>'
             f'</span></li>'
         )
     return (
@@ -802,8 +954,8 @@ def synthesize_with_modal(question: str, context: str) -> str:
             "The AI synthesizer timed out (the model may be cold-starting). "
             "Please try again in a few seconds."
         )
-    except requests.RequestException:
-        return "The AI synthesizer is unavailable right now. Please try again shortly."
+    except requests.RequestException as exc:
+        return _modal_request_error_message(exc, "The AI synthesizer")
 
     try:
         payload = response.json()
@@ -854,7 +1006,7 @@ def ask_scholar_lens(question: str) -> tuple[str, str]:
             "",
         )
     answer = synthesize_with_modal(clean_question, context)
-    return answer, _render_references(papers)
+    return f"**Search terms used:** `{search_query}`\n\n{answer}", _render_references(papers)
 
 
 def select_result(event: gr.SelectData) -> int | None:
@@ -940,12 +1092,14 @@ def clear_search():
     return (
         "Enter a research topic to begin.",
         table,
+        "",
         [],
         gr.update(choices=[], value=None),
         label,
         page,
         prev_update,
         next_update,
+        None,
         "",
         "",
         "",
@@ -954,6 +1108,7 @@ def clear_search():
         "",
         DEFAULT_LOAD_STATUS,
         "",
+        None,
     )
 
 
@@ -1131,6 +1286,75 @@ CUSTOM_CSS = """
 .source-badge.arxiv { color: #f87171 !important; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); }
 .source-badge.pubmed { color: #34d399 !important; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); }
 
+.status-line {
+    color: var(--sl-muted) !important;
+    padding: 4px 2px;
+}
+.insight-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin: 12px 0 14px;
+}
+.insight-card {
+    border: 1px solid var(--sl-border);
+    border-radius: 8px;
+    background: var(--sl-panel);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.insight-card span {
+    color: var(--sl-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 700;
+}
+.insight-card strong { color: var(--sl-text-bright); font-size: 20px; line-height: 1.1; }
+.insight-card small { color: var(--sl-muted); font-size: 12px; }
+.action-row { align-items: end; gap: 12px; }
+.action-cell {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.row-action {
+    color: var(--sl-accent-bright);
+    font-size: 12px;
+    font-weight: 700;
+}
+.btn-crimson button {
+    border-color: rgba(239, 68, 68, 0.4) !important;
+    color: #fecaca !important;
+}
+.sample-row {
+    gap: 8px;
+    margin: 6px 0 12px;
+}
+.sample-row button {
+    white-space: normal !important;
+    line-height: 1.25 !important;
+}
+.summarize-panel {
+    border: 1px solid var(--sl-border);
+    border-radius: 8px;
+    background: var(--sl-panel);
+    padding: 16px;
+}
+.about-card {
+    max-width: 820px;
+    border: 1px solid var(--sl-border);
+    border-radius: 8px;
+    background: var(--sl-panel);
+    padding: 22px 24px;
+    line-height: 1.65;
+}
+.about-card h2 { margin-top: 0; color: var(--sl-text-bright); }
+.download-action { margin-top: 8px; }
+
 /* ===== ASK / SYNTHESIS ===== */
 .ask-intro { color: var(--sl-muted) !important; margin-bottom: 6px; }
 .answer-card {
@@ -1167,6 +1391,7 @@ CUSTOM_CSS = """
 .ref-link { color: var(--sl-text-bright) !important; font-weight: 600; text-decoration: none; }
 .ref-link:hover { color: var(--sl-accent-bright) !important; text-decoration: underline; }
 .ref-meta { color: var(--sl-muted); font-size: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ref-snippet { color: var(--sl-text); font-size: 13px; line-height: 1.45; }
 
 /* Remove system buttons and footers */
 .settings, footer, .show-api { display: none !important; }
@@ -1258,7 +1483,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     )
                     with gr.Row():
                         question_input = gr.Textbox(
-                            label="",
+                            label="Research question",
                             placeholder="e.g. What are the main approaches to early Alzheimer's detection from MRI, and where do they disagree?",
                             scale=5,
                             container=False,
@@ -1272,6 +1497,15 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         elem_classes=["answer-card"],
                     )
                     references_output = gr.HTML()
+
+                    with gr.Row(elem_classes=["sample-row"]):
+                        for sample_question in SAMPLE_QUESTIONS:
+                            sample_button = gr.Button(sample_question, size="sm", scale=1)
+                            sample_button.click(
+                                fn=lambda sample=sample_question: ask_example(sample),
+                                outputs=[question_input, answer_output, references_output],
+                                show_progress="full",
+                            )
 
                     ask_button.click(
                         fn=ask_scholar_lens,
@@ -1289,7 +1523,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                 with gr.Tab("🔍  Search", id="search"):
                     with gr.Row():
                         query_input = gr.Textbox(
-                            label="",
+                            label="Search topic",
                             placeholder="Enter research topic (e.g., 'Quantum computing in drug discovery')",
                             scale=5,
                             container=False,
@@ -1300,7 +1534,14 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             clear_button = gr.Button("Clear")
 
                     status_output = gr.Markdown("Ready for search.", elem_classes=["status-line"])
+                    insights_output = gr.HTML()
                     results_output = gr.HTML(_render_results_table([]))
+                    results_download = gr.DownloadButton(
+                        "Download Results CSV",
+                        value=None,
+                        size="sm",
+                        elem_classes=["download-action"],
+                    )
 
                     with gr.Row(elem_classes=["page-row"]):
                         prev_button = gr.Button("← Prev", scale=0, min_width=100, interactive=False)
@@ -1321,12 +1562,14 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     search_outputs = [
                         status_output,
                         results_output,
+                        insights_output,
                         papers_state,
                         paper_selector,
                         page_label,
                         page_state,
                         prev_button,
                         next_button,
+                        results_download,
                     ]
                     search_button.click(
                         fn=search_all_sources,
@@ -1370,15 +1613,32 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             label="Paper Context",
                             lines=10,
                             max_length=SUMMARY_INPUT_CHAR_LIMIT,
+                            buttons=["copy"],
                         )
                         summarize_button = gr.Button("✨ Summarize with AI", variant="primary")
-                        summary_output = gr.Textbox(label="AI Synthesis", lines=8, interactive=False)
+                        summary_output = gr.Textbox(
+                            label="AI Synthesis",
+                            lines=8,
+                            interactive=False,
+                            buttons=["copy"],
+                        )
+                        summary_download = gr.DownloadButton(
+                            "Download Summary Markdown",
+                            value=None,
+                            size="sm",
+                            elem_classes=["download-action"],
+                        )
 
                     summarize_button.click(
                         fn=summarize_with_modal, 
                         inputs=source_text, 
                         outputs=summary_output,
                         show_progress="full",
+                    )
+                    summary_download.click(
+                        fn=export_summary_markdown,
+                        inputs=[source_text, summary_output],
+                        outputs=summary_download,
                     )
                     
                     # Native dropdown selection (type="index" gives the chosen
@@ -1437,12 +1697,14 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                 outputs=[
                     status_output,
                     results_output,
+                    insights_output,
                     papers_state,
                     paper_selector,
                     page_label,
                     page_state,
                     prev_button,
                     next_button,
+                    results_download,
                     source_text,
                     summary_output,
                     query_input,
@@ -1451,6 +1713,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     references_output,
                     load_status_output,
                     hidden_selected_index,
+                    summary_download,
                 ],
             )
 
