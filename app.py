@@ -313,19 +313,28 @@ def _render_results_table(results: list[PaperResult], start_index: int = 0) -> s
         """
     rows = []
     for offset, result in enumerate(results):
-        number = start_index + offset + 1
+        result_index = start_index + offset
+        number = result_index + 1
         safe_url = html.escape(result.url, quote=True)
         rows.append(
             textwrap.dedent(
                 f"""
-                <tr class="result-row">
+                <tr
+                    id="row-{result_index}"
+                    class="result-row"
+                    role="button"
+                    tabindex="0"
+                    aria-label="Select paper {number}: {html.escape(result.title, quote=True)}"
+                    onclick="selectPaper(event, {result_index})"
+                    onkeydown="selectPaperFromKey(event, {result_index})"
+                >
                     <td class="num-cell">{number}</td>
                     <td class="title-cell">{html.escape(result.title)}</td>
                     <td class="year-cell">{html.escape(result.year)}</td>
                     <td>{_source_badge(result.source)}</td>
                     <td class="authors-cell">{html.escape(result.authors)}</td>
                     <td class="citation-cell">{html.escape(result.citations)}</td>
-                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">Open ↗</a></td>
+                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Open ↗</a></td>
                 </tr>
                 """
             ).strip()
@@ -634,6 +643,27 @@ def summarize_selected_paper(
     return paper_text, load_status, summarize_with_modal(paper_text), tab_update
 
 
+def summarize_row_selection(
+    selected_index: Any,
+    results: list[PaperResult],
+) -> tuple[str, str, str, gr.Tabs, gr.Dropdown]:
+    paper_text, load_status, summary, tab_update = summarize_selected_paper(
+        selected_index,
+        results,
+    )
+    try:
+        dropdown_value = int(selected_index)
+    except (TypeError, ValueError):
+        dropdown_value = None
+    return (
+        paper_text,
+        load_status,
+        summary,
+        tab_update,
+        gr.update(value=dropdown_value),
+    )
+
+
 def clear_search():
     table, label, page = _page_view([], 0)
     return (
@@ -868,7 +898,10 @@ CUSTOM_CSS = """
 # launch(), not on Blocks()). Powers click-to-select on the results table.
 HEAD_SCRIPT = """
 <script>
-function selectPaper(index) {
+function selectPaper(event, index) {
+    if (event && event.target && event.target.closest('a')) {
+        return;
+    }
     const input = document.querySelector('#hidden_index_input textarea');
     if (input) {
         input.value = index;
@@ -883,6 +916,13 @@ function selectPaper(index) {
         const btn = document.querySelector('#hidden_select_btn button');
         if (btn) btn.click();
     }, 50);
+}
+
+function selectPaperFromKey(event, index) {
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectPaper(event, index);
+    }
 }
 </script>
 """
@@ -1028,6 +1068,17 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         outputs=[results_output, page_label, page_state],
                     )
 
+                    hidden_selected_index = gr.Textbox(
+                        label="Selected row index",
+                        elem_id="hidden_index_input",
+                        elem_classes=["hidden-component"],
+                    )
+                    hidden_select_button = gr.Button(
+                        "Select row",
+                        elem_id="hidden_select_btn",
+                        elem_classes=["hidden-component"],
+                    )
+
                 with gr.Tab("✨  Summarize", id="summarize"):
                     with gr.Column(elem_classes=["summarize-panel"]):
                         load_status_output = gr.Markdown("Select a paper to summarize.")
@@ -1048,6 +1099,18 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         fn=summarize_selected_paper,
                         inputs=[paper_selector, papers_state],
                         outputs=[source_text, load_status_output, summary_output, app_tabs],
+                        show_progress="full",
+                    )
+                    hidden_select_button.click(
+                        fn=summarize_row_selection,
+                        inputs=[hidden_selected_index, papers_state],
+                        outputs=[
+                            source_text,
+                            load_status_output,
+                            summary_output,
+                            app_tabs,
+                            paper_selector,
+                        ],
                         show_progress="full",
                     )
 
