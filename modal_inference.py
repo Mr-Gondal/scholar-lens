@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+import hmac
+import os
+from typing import Annotated
+
 import modal
+from fastapi import Header, HTTPException
 
 app = modal.App("scholar-lens-summarizer")
 
@@ -26,7 +33,10 @@ image = (
     timeout=300,
     # Keep warm briefly for live demos without leaving an expensive GPU idle.
     scaledown_window=90,
-    secrets=[modal.Secret.from_name("huggingface")],
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("scholar-lens-api"),
+    ],
 )
 class Summarizer:
     @modal.enter()
@@ -58,8 +68,29 @@ class Summarizer:
         )
         return outputs[0].outputs[0].text.strip()
 
+    def _require_auth(self, authorization: str | None) -> None:
+        expected_token = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
+        if not expected_token:
+            raise HTTPException(
+                status_code=500,
+                detail="Modal API token is not configured.",
+            )
+
+        prefix = "Bearer "
+        if not authorization or not authorization.startswith(prefix):
+            raise HTTPException(status_code=401, detail="Unauthorized.")
+
+        provided_token = authorization[len(prefix) :].strip()
+        if not hmac.compare_digest(provided_token, expected_token):
+            raise HTTPException(status_code=401, detail="Unauthorized.")
+
     @modal.fastapi_endpoint(method="POST", label="scholar-lens-summarizer-summarize-paper")
-    def summarize_paper(self, data: dict) -> dict:
+    def summarize_paper(
+        self,
+        data: dict,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        self._require_auth(authorization)
         text = (data or {}).get("text", "")
         if not text:
             return {"error": "No text provided in the request body."}
@@ -76,13 +107,18 @@ class Summarizer:
         return {"summary": summary}
 
     @modal.fastapi_endpoint(method="POST", label="scholar-lens-summarizer-synthesize")
-    def synthesize(self, data: dict) -> dict:
+    def synthesize(
+        self,
+        data: dict,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
         """Answer a research question grounded ONLY in the supplied abstracts.
 
         Expects ``{"question": str, "context": str}`` where ``context`` is a
         block of numbered papers ([1], [2], ...). The model must cite those
         numbers, which keeps it from inventing sources.
         """
+        self._require_auth(authorization)
         question = (data or {}).get("question", "")
         context = (data or {}).get("context", "")
         if not question or not context:

@@ -62,10 +62,23 @@ The app launches a local Gradio server and prints the URL in the terminal.
 - `summarize_paper` — condenses a single abstract or pasted text (`MODAL_SUMMARIZE_URL`).
 - `synthesize` — answers a question grounded in numbered abstracts, with `[n]` citations (`MODAL_SYNTHESIZE_URL`).
 
+Create a shared API token and store the same value in both places:
+
+- In your Gradio/Hugging Face Space environment: `SCHOLAR_LENS_MODAL_TOKEN`.
+- In Modal, create a secret named `scholar-lens-api` with `SCHOLAR_LENS_MODAL_TOKEN`.
+
 Deploy with:
 
 ```bash
 modal deploy modal_inference.py
 ```
 
-If you deploy your own endpoints, update `MODAL_SUMMARIZE_URL` and `MODAL_SYNTHESIZE_URL` in `app.py` to match the URLs Modal prints.
+After deployment, set these Gradio/Hugging Face Space environment variables to the URLs Modal prints:
+
+```text
+MODAL_SUMMARIZE_URL=https://your-summarize-endpoint.modal.run
+MODAL_SYNTHESIZE_URL=https://your-synthesize-endpoint.modal.run
+SCHOLAR_LENS_MODAL_TOKEN=your-shared-secret-token
+```
+
+The Modal endpoints reject requests that do not include the matching `Authorization: Bearer <token>` header.

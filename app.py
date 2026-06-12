@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import textwrap
 import xml.etree.ElementTree as ET
@@ -17,8 +18,9 @@ REQUEST_TIMEOUT_SECONDS = 15
 # Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
 # reliable responses. Replace with your own email if you like.
 CONTACT_EMAIL = "hussainharis946@gmail.com"
-MODAL_SUMMARIZE_URL = "https://kinggondal731--scholar-lens-summarizer-summarize-paper.modal.run"
-MODAL_SYNTHESIZE_URL = "https://kinggondal731--scholar-lens-summarizer-synthesize.modal.run"
+MODAL_SUMMARIZE_URL = os.getenv("MODAL_SUMMARIZE_URL", "").strip()
+MODAL_SYNTHESIZE_URL = os.getenv("MODAL_SYNTHESIZE_URL", "").strip()
+MODAL_API_TOKEN = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
 # How many retrieved papers (that actually have an abstract) to feed the model.
 SYNTHESIS_PAPER_COUNT = 6
 # Results shown per page in the Search results table.
@@ -466,13 +468,35 @@ def change_page(results: list[PaperResult], page: int, delta: int) -> tuple[str,
     return _page_view(results, (page or 0) + delta)
 
 
+def _modal_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {MODAL_API_TOKEN}"}
+
+
+def _modal_config_error(endpoint_url: str) -> str | None:
+    if not endpoint_url:
+        return (
+            "The AI endpoint is not configured. Set the Modal endpoint URL "
+            "environment variable before using this feature."
+        )
+    if not MODAL_API_TOKEN:
+        return (
+            "The AI endpoint token is not configured. Set "
+            "SCHOLAR_LENS_MODAL_TOKEN before using this feature."
+        )
+    return None
+
+
 def summarize_with_modal(text: str) -> str:
     if not text or len(text.strip()) < 50:
         return "Please provide a longer abstract or paper text to summarize."
+    config_error = _modal_config_error(MODAL_SUMMARIZE_URL)
+    if config_error:
+        return config_error
     try:
         response = requests.post(
             MODAL_SUMMARIZE_URL,
             json={"text": text},
+            headers=_modal_headers(),
             timeout=120,
         )
         response.raise_for_status()
@@ -535,10 +559,14 @@ def _render_references(papers: list[PaperResult]) -> str:
 
 
 def synthesize_with_modal(question: str, context: str) -> str:
+    config_error = _modal_config_error(MODAL_SYNTHESIZE_URL)
+    if config_error:
+        return config_error
     try:
         response = requests.post(
             MODAL_SYNTHESIZE_URL,
             json={"question": question, "context": context},
+            headers=_modal_headers(),
             timeout=180,
         )
         response.raise_for_status()
