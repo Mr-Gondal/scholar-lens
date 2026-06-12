@@ -4,7 +4,7 @@ import html
 import re
 import textwrap
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,9 +12,19 @@ import gradio as gr
 import requests
 
 APP_TITLE = "Scholar Lens"
-SEARCH_LIMIT_PER_SOURCE = 8
-REQUEST_TIMEOUT_SECONDS = 12
+SEARCH_LIMIT_PER_SOURCE = 10
+REQUEST_TIMEOUT_SECONDS = 15
+# Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
+# reliable responses. Replace with your own email if you like.
+CONTACT_EMAIL = "hussainharis946@gmail.com"
 MODAL_SUMMARIZE_URL = "https://kinggondal731--scholar-lens-summarizer-summarize-paper.modal.run"
+MODAL_SYNTHESIZE_URL = "https://kinggondal731--scholar-lens-summarizer-synthesize.modal.run"
+# How many retrieved papers (that actually have an abstract) to feed the model.
+SYNTHESIS_PAPER_COUNT = 6
+# Results shown per page in the Search results table.
+RESULTS_PER_PAGE = 10
+# Trim very long abstracts so the grounded prompt stays a reasonable size.
+MAX_ABSTRACT_CHARS = 1400
 
 
 @dataclass(frozen=True)
@@ -26,6 +36,7 @@ class PaperResult:
     citations: str
     url: str
     abstract: str = ""
+    doi: str = ""
 
 
 def _safe_text(value: Any, fallback: str = "Unknown") -> str:
@@ -62,30 +73,104 @@ def _request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
-def search_semantic_scholar(query: str) -> tuple[list[PaperResult], str | None]:
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+def _reconstruct_abstract(inverted_index: dict[str, list[int]] | None) -> str:
+    """Rebuild plain text from OpenAlex's abstract inverted index.
+
+    OpenAlex never returns a plain ``abstract`` field; it returns a
+    ``{word: [positions]}`` map. We sort words back into reading order.
+    """
+    if not inverted_index:
+        return ""
+    positioned: list[tuple[int, str]] = []
+    for word, positions in inverted_index.items():
+        for position in positions:
+            positioned.append((position, word))
+    positioned.sort(key=lambda pair: pair[0])
+    return " ".join(word for _, word in positioned)
+
+
+def _strip_markup(text: str) -> str:
+    """Crossref abstracts are JATS XML; reduce them to plain text."""
+    return " ".join(re.sub(r"<[^>]+>", " ", text or "").split())
+
+
+def _normalize_doi(value: str) -> str:
+    doi = (value or "").lower().strip()
+    return re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+
+
+def search_openalex(query: str) -> tuple[list[PaperResult], str | None]:
+    url = "https://api.openalex.org/works"
     params = {
-        "query": query,
-        "limit": SEARCH_LIMIT_PER_SOURCE,
-        "fields": "title,year,authors,citationCount,url,abstract",
+        "search": query,
+        "per_page": SEARCH_LIMIT_PER_SOURCE,
+        "filter": "has_abstract:true",
+        "mailto": CONTACT_EMAIL,
     }
     try:
         payload = _request_json(url, params)
     except requests.RequestException:
-        return [], "Semantic Scholar is unavailable right now."
+        return [], "OpenAlex is unavailable right now."
 
     results: list[PaperResult] = []
-    for paper in payload.get("data", []):
-        authors = [author.get("name", "") for author in paper.get("authors", [])]
+    for work in payload.get("results", []):
+        authors = [
+            authorship.get("author", {}).get("display_name", "")
+            for authorship in work.get("authorships", [])
+        ]
         results.append(
             PaperResult(
-                title=_safe_text(paper.get("title"), "Untitled paper"),
-                year=_safe_text(paper.get("year")),
-                source="Semantic Scholar",
+                title=_safe_text(work.get("title"), "Untitled paper"),
+                year=_safe_text(work.get("publication_year")),
+                source="OpenAlex",
                 authors=_shorten_authors(authors),
-                citations=_safe_text(paper.get("citationCount"), "0"),
-                url=_safe_text(paper.get("url"), "#"),
-                abstract=_safe_text(paper.get("abstract"), ""),
+                citations=_safe_text(work.get("cited_by_count"), "0"),
+                url=_safe_text(work.get("doi") or work.get("id"), "#"),
+                abstract=_reconstruct_abstract(work.get("abstract_inverted_index")),
+                doi=_normalize_doi(work.get("doi", "")),
+            )
+        )
+    return results, None
+
+
+def _crossref_year(item: dict[str, Any]) -> str:
+    for key in ("published", "published-print", "published-online", "issued"):
+        parts = item.get(key, {}).get("date-parts", [])
+        if parts and parts[0] and parts[0][0]:
+            return str(parts[0][0])
+    return "Unknown"
+
+
+def search_crossref(query: str) -> tuple[list[PaperResult], str | None]:
+    url = "https://api.crossref.org/works"
+    params = {
+        "query": query,
+        "rows": SEARCH_LIMIT_PER_SOURCE,
+        "filter": "has-abstract:true",
+        "mailto": CONTACT_EMAIL,
+    }
+    try:
+        payload = _request_json(url, params)
+    except requests.RequestException:
+        return [], "Crossref is unavailable right now."
+
+    results: list[PaperResult] = []
+    for item in payload.get("message", {}).get("items", []):
+        title_list = item.get("title") or ["Untitled paper"]
+        authors = [
+            f"{author.get('given', '')} {author.get('family', '')}".strip()
+            for author in item.get("author", [])
+        ]
+        results.append(
+            PaperResult(
+                title=_safe_text(title_list[0], "Untitled paper"),
+                year=_crossref_year(item),
+                source="Crossref",
+                authors=_shorten_authors(authors),
+                citations=_safe_text(item.get("is-referenced-by-count"), "0"),
+                url=_safe_text(item.get("URL"), "#"),
+                abstract=_strip_markup(item.get("abstract", "")),
+                doi=_normalize_doi(item.get("DOI", "")),
             )
         )
     return results, None
@@ -204,7 +289,8 @@ def _fetch_pubmed_abstracts(paper_ids: list[str]) -> dict[str, str]:
 
 def _source_badge(source: str) -> str:
     config = {
-        "Semantic Scholar": ("semantic", "🧠"),
+        "OpenAlex": ("openalex", "🌐"),
+        "Crossref": ("crossref", "🔗"),
         "arXiv": ("arxiv", "📐"),
         "PubMed": ("pubmed", "🧬"),
     }
@@ -216,7 +302,7 @@ def _source_badge(source: str) -> str:
     )
 
 
-def _render_results_table(results: list[PaperResult]) -> str:
+def _render_results_table(results: list[PaperResult], start_index: int = 0) -> str:
     if not results:
         return """
         <div class="empty-state">
@@ -226,21 +312,20 @@ def _render_results_table(results: list[PaperResult]) -> str:
         </div>
         """
     rows = []
-    for i, result in enumerate(results):
+    for offset, result in enumerate(results):
+        number = start_index + offset + 1
         safe_url = html.escape(result.url, quote=True)
         rows.append(
             textwrap.dedent(
                 f"""
-                <tr class="result-row" onclick="selectPaper({i})" id="row-{i}">
-                    <td class="select-cell">
-                        <input type="radio" name="paper-select" id="radio-{i}" onclick="event.stopPropagation(); selectPaper({i})">
-                    </td>
+                <tr class="result-row">
+                    <td class="num-cell">{number}</td>
                     <td class="title-cell">{html.escape(result.title)}</td>
                     <td class="year-cell">{html.escape(result.year)}</td>
                     <td>{_source_badge(result.source)}</td>
                     <td class="authors-cell">{html.escape(result.authors)}</td>
                     <td class="citation-cell">{html.escape(result.citations)}</td>
-                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Open ↗</a></td>
+                    <td><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">Open ↗</a></td>
                 </tr>
                 """
             ).strip()
@@ -250,7 +335,7 @@ def _render_results_table(results: list[PaperResult]) -> str:
         <table class="results-table">
             <thead>
                 <tr>
-                    <th style="width: 40px;"></th>
+                    <th style="width: 40px;">#</th>
                     <th>Title</th>
                     <th>Year</th>
                     <th>Source</th>
@@ -265,40 +350,50 @@ def _render_results_table(results: list[PaperResult]) -> str:
     """
 
 
+def _page_view(results: list[PaperResult], page: int) -> tuple[str, str, int]:
+    """Return (table_html, page_label, clamped_page) for one page of results."""
+    total_pages = max(1, (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * RESULTS_PER_PAGE
+    chunk = results[start:start + RESULTS_PER_PAGE]
+    table = _render_results_table(chunk, start_index=start)
+    label = f"Page {page + 1} of {total_pages} · {len(results)} papers" if results else ""
+    return table, label, page
+
+
 def _dedupe_results(results: list[PaperResult]) -> list[PaperResult]:
     """Drop duplicate papers that appear in more than one source.
 
     Papers are matched on a normalized title; the first occurrence wins so we
     keep the source order produced by the search functions.
     """
-    seen: set[str] = set()
+    seen_dois: set[str] = set()
+    seen_titles: set[str] = set()
     unique: list[PaperResult] = []
     for result in results:
-        key = re.sub(r"[^a-z0-9]+", "", result.title.lower())
-        if not key or key in seen:
+        doi = _normalize_doi(result.doi)
+        if doi and doi in seen_dois:
             continue
-        seen.add(key)
+        title_key = re.sub(r"[^a-z0-9]+", "", result.title.lower())
+        if title_key and title_key in seen_titles:
+            continue
+        if doi:
+            seen_dois.add(doi)
+        if title_key:
+            seen_titles.add(title_key)
         unique.append(result)
     return unique
 
 
-def search_all_sources(query: str) -> tuple[str, str, list[PaperResult], int | None]:
-    clean_query = query.strip()
-    if not clean_query:
-        return (
-            "Enter a research topic to search Semantic Scholar, arXiv, and PubMed.",
-            _render_results_table([]),
-            [],
-            None,
-        )
-
-    search_functions = [search_semantic_scholar, search_arxiv, search_pubmed]
+def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
+    """Query every source in parallel, then de-duplicate and sort by year."""
+    search_functions = [search_openalex, search_crossref, search_arxiv, search_pubmed]
     results: list[PaperResult] = []
     warnings: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_to_search = {executor.submit(fn, clean_query): fn.__name__ for fn in search_functions}
-        for future in future_to_search:
+    with ThreadPoolExecutor(max_workers=len(search_functions)) as executor:
+        future_to_search = {executor.submit(fn, query): fn.__name__ for fn in search_functions}
+        for future in as_completed(future_to_search):
             try:
                 source_results, warning = future.result()
                 results.extend(source_results)
@@ -315,6 +410,27 @@ def search_all_sources(query: str) -> tuple[str, str, list[PaperResult], int | N
         return (1, int(item.year))
 
     results.sort(key=_sort_key, reverse=True)
+    return results, warnings
+
+
+def _selector_choices(results: list[PaperResult]) -> list[str]:
+    return [f"{index + 1}. {result.title}" for index, result in enumerate(results)]
+
+
+def search_all_sources(query: str):
+    clean_query = query.strip()
+    if not clean_query:
+        table, label, page = _page_view([], 0)
+        return (
+            "Enter a research topic to search OpenAlex, Crossref, arXiv, and PubMed.",
+            table,
+            [],
+            gr.update(choices=[], value=None),
+            label,
+            page,
+        )
+
+    results, warnings = _collect_results(clean_query)
 
     if warnings and results:
         status = f"✓ Found **{len(results)}** papers. " + " ".join(warnings)
@@ -326,12 +442,19 @@ def search_all_sources(query: str) -> tuple[str, str, list[PaperResult], int | N
     if not results:
         status = "No papers found. Try a broader research topic or a different phrase."
 
+    table, label, page = _page_view(results, 0)
     return (
         status,
-        _render_results_table(results),
+        table,
         results,
-        None,
+        gr.update(choices=_selector_choices(results), value=None),
+        label,
+        page,
     )
+
+
+def change_page(results: list[PaperResult], page: int, delta: int) -> tuple[str, str, int]:
+    return _page_view(results, (page or 0) + delta)
 
 
 def summarize_with_modal(text: str) -> str:
@@ -360,6 +483,99 @@ def summarize_with_modal(text: str) -> str:
     if isinstance(payload, dict):
         return _safe_text(payload.get("summary") or payload.get("error"), "No summary returned.")
     return _safe_text(payload, "No summary returned.")
+
+
+def _papers_for_synthesis(results: list[PaperResult]) -> list[PaperResult]:
+    """Pick the top results that actually carry an abstract to ground on."""
+    with_abstract = [paper for paper in results if paper.abstract.strip()]
+    return with_abstract[:SYNTHESIS_PAPER_COUNT]
+
+
+def _build_synthesis_context(papers: list[PaperResult]) -> str:
+    blocks = []
+    for index, paper in enumerate(papers, start=1):
+        abstract = paper.abstract.strip()
+        if len(abstract) > MAX_ABSTRACT_CHARS:
+            abstract = abstract[:MAX_ABSTRACT_CHARS].rstrip() + "..."
+        blocks.append(
+            f"[{index}] Title: {paper.title}\n"
+            f"Source: {paper.source} ({paper.year})\n"
+            f"Abstract: {abstract}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _render_references(papers: list[PaperResult]) -> str:
+    if not papers:
+        return ""
+    items = []
+    for index, paper in enumerate(papers, start=1):
+        safe_url = html.escape(paper.url, quote=True)
+        items.append(
+            f'<li class="ref-item">'
+            f'<span class="ref-num">[{index}]</span>'
+            f'<span class="ref-body">'
+            f'<a class="ref-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(paper.title)}</a>'
+            f'<span class="ref-meta">{_source_badge(paper.source)} · {html.escape(paper.year)} · {html.escape(paper.authors)}</span>'
+            f'</span></li>'
+        )
+    return (
+        '<div class="refs-shell"><h3>📚 Sources the answer is grounded in</h3>'
+        f'<ul class="refs-list">{"".join(items)}</ul></div>'
+    )
+
+
+def synthesize_with_modal(question: str, context: str) -> str:
+    try:
+        response = requests.post(
+            MODAL_SYNTHESIZE_URL,
+            json={"question": question, "context": context},
+            timeout=180,
+        )
+        response.raise_for_status()
+    except requests.Timeout:
+        return (
+            "The AI synthesizer timed out (the model may be cold-starting). "
+            "Please try again in a few seconds."
+        )
+    except requests.RequestException:
+        return "The AI synthesizer is unavailable right now. Please try again shortly."
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return "The AI synthesizer returned an unexpected response. Please try again shortly."
+
+    if isinstance(payload, dict):
+        return _safe_text(payload.get("answer") or payload.get("error"), "No answer returned.")
+    return _safe_text(payload, "No answer returned.")
+
+
+def ask_scholar_lens(question: str) -> tuple[str, str]:
+    """Search every source, then have the small model answer with citations."""
+    clean_question = question.strip()
+    if not clean_question:
+        return "Enter a research question to begin.", ""
+
+    results, warnings = _collect_results(clean_question)
+    if not results:
+        note = " ".join(warnings) if warnings else ""
+        return (
+            f"No papers were found for that question. Try rephrasing it.\n\n{note}".strip(),
+            "",
+        )
+
+    papers = _papers_for_synthesis(results)
+    if not papers:
+        return (
+            "Papers were found, but none included an abstract to reason over. "
+            "Try a broader or differently worded question.",
+            "",
+        )
+
+    context = _build_synthesis_context(papers)
+    answer = synthesize_with_modal(clean_question, context)
+    return answer, _render_references(papers)
 
 
 def select_result(event: gr.SelectData) -> int | None:
@@ -398,10 +614,14 @@ def load_selected_paper(
 
 
 def summarize_selected_paper(
-    selected_index: int | None,
+    selected_index: Any,
     results: list[PaperResult],
 ) -> tuple[str, str, str, gr.Tabs]:
-    paper_text, load_status, _, tab_update = load_selected_paper(selected_index, results)
+    try:
+        index = int(selected_index)
+    except (TypeError, ValueError):
+        index = None
+    paper_text, load_status, _, tab_update = load_selected_paper(index, results)
     if not paper_text:
         return paper_text, load_status, "", tab_update
     if "No abstract is available" in paper_text:
@@ -414,12 +634,15 @@ def summarize_selected_paper(
     return paper_text, load_status, summarize_with_modal(paper_text), tab_update
 
 
-def clear_search() -> tuple[str, str, list[PaperResult], int | None, str, str]:
+def clear_search():
+    table, label, page = _page_view([], 0)
     return (
         "Enter a research topic to begin.",
-        _render_results_table([]),
+        table,
         [],
-        None,
+        gr.update(choices=[], value=None),
+        label,
+        page,
         "",
         "",
     )
@@ -587,16 +810,83 @@ CUSTOM_CSS = """
     font-weight: 600;
     color: var(--sl-text-bright) !important;
 }
+.num-cell { color: var(--sl-muted); text-align: center; font-variant-numeric: tabular-nums; }
 
-.source-badge.semantic { color: #60a5fa !important; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); }
+/* ===== PAGINATION ===== */
+.page-row { align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
+.page-label { text-align: center; color: var(--sl-muted) !important; min-width: 180px; }
+
+.source-badge.openalex { color: #22d3ee !important; background: rgba(34, 211, 238, 0.1); border: 1px solid rgba(34, 211, 238, 0.3); }
+.source-badge.crossref { color: #fbbf24 !important; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); }
 .source-badge.arxiv { color: #f87171 !important; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); }
 .source-badge.pubmed { color: #34d399 !important; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); }
+
+/* ===== ASK / SYNTHESIS ===== */
+.ask-intro { color: var(--sl-muted) !important; margin-bottom: 6px; }
+.answer-card {
+    background: var(--sl-panel) !important;
+    border: 1px solid var(--sl-border);
+    border-left: 4px solid var(--sl-accent);
+    border-radius: 12px;
+    padding: 20px 24px !important;
+    margin-top: 16px;
+    line-height: 1.65;
+    font-size: 15px;
+}
+.answer-card p { color: var(--sl-text) !important; }
+
+.refs-shell {
+    margin-top: 18px;
+    border: 1px solid var(--sl-border);
+    border-radius: 12px;
+    background: var(--sl-panel);
+    padding: 16px 20px;
+}
+.refs-shell h3 {
+    margin: 0 0 12px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--sl-accent-bright);
+}
+.refs-list { list-style: none; margin: 0; padding: 0; }
+.ref-item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--sl-border-soft); }
+.ref-item:last-child { border-bottom: none; }
+.ref-num { color: var(--sl-accent-bright); font-weight: 700; flex-shrink: 0; }
+.ref-body { display: flex; flex-direction: column; gap: 4px; }
+.ref-link { color: var(--sl-text-bright) !important; font-weight: 600; text-decoration: none; }
+.ref-link:hover { color: var(--sl-accent-bright) !important; text-decoration: underline; }
+.ref-meta { color: var(--sl-muted); font-size: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* Remove system buttons and footers */
 .settings, footer, .show-api { display: none !important; }
 
 .hidden-component { display: none !important; }
 """
+
+# Injected into the page <head> at launch time (Gradio 6 takes `head` on
+# launch(), not on Blocks()). Powers click-to-select on the results table.
+HEAD_SCRIPT = """
+<script>
+function selectPaper(index) {
+    const input = document.querySelector('#hidden_index_input textarea');
+    if (input) {
+        input.value = index;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
+    const row = document.getElementById('row-' + index);
+    if (row) row.classList.add('selected');
+    const radio = document.getElementById('radio-' + index);
+    if (radio) radio.checked = true;
+    setTimeout(() => {
+        const btn = document.querySelector('#hidden_select_btn button');
+        if (btn) btn.click();
+    }, 50);
+}
+</script>
+"""
+
 
 def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
     theme = gr.themes.Base(
@@ -612,33 +902,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
         button_primary_text_color="#ffffff",
     )
 
-    with gr.Blocks(title=APP_TITLE, head="""
-        <script>
-        function selectPaper(index) {
-            // Update the hidden input
-            const input = document.querySelector('#hidden_index_input textarea');
-            if (input) {
-                input.value = index;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-            
-            // Highlight the row
-            document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
-            const row = document.getElementById('row-' + index);
-            if (row) row.classList.add('selected');
-            
-            // Check the radio button
-            const radio = document.getElementById('radio-' + index);
-            if (radio) radio.checked = true;
-            
-            // Trigger the hidden button
-            setTimeout(() => {
-                const btn = document.querySelector('#hidden_select_btn button');
-                if (btn) btn.click();
-            }, 50);
-        }
-        </script>
-    """) as app:
+    with gr.Blocks(title=APP_TITLE) as app:
         with gr.Column(elem_classes=["main-shell"]):
             gr.HTML(
                 """
@@ -649,7 +913,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             <h1>Scholar <span class="accent">Lens</span></h1>
                             <p>Professional Research Discovery & Synthesis Engine</p>
                             <div class="header-chips">
-                                <span class="header-chip">Semantic Scholar</span>
+                                <span class="header-chip">OpenAlex</span>
+                                <span class="header-chip">Crossref</span>
                                 <span class="header-chip">arXiv</span>
                                 <span class="header-chip">PubMed</span>
                             </div>
@@ -660,13 +925,46 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
             )
 
             papers_state = gr.State([])
-            selected_index_state = gr.State(None)
-            
-            # Hidden components for JS communication
-            hidden_index_input = gr.Textbox(visible=False, elem_id="hidden_index_input")
-            hidden_select_btn = gr.Button(visible=False, elem_id="hidden_select_btn")
+            page_state = gr.State(0)
 
-            with gr.Tabs(selected="search") as app_tabs:
+            with gr.Tabs(selected="ask") as app_tabs:
+                with gr.Tab("💬  Ask", id="ask"):
+                    gr.Markdown(
+                        "Ask a research question. Scholar Lens searches **OpenAlex, "
+                        "Crossref, arXiv, and PubMed**, then a small open model "
+                        "(Qwen2.5-7B) writes a synthesized, **cited** answer grounded "
+                        "only in the retrieved abstracts.",
+                        elem_classes=["ask-intro"],
+                    )
+                    with gr.Row():
+                        question_input = gr.Textbox(
+                            label="",
+                            placeholder="e.g. What are the main approaches to early Alzheimer's detection from MRI, and where do they disagree?",
+                            scale=5,
+                            container=False,
+                            lines=2,
+                        )
+                        ask_button = gr.Button("💬 Ask", variant="primary", scale=1)
+
+                    answer_output = gr.Markdown(
+                        "Your grounded, cited answer will appear here.",
+                        elem_classes=["answer-card"],
+                    )
+                    references_output = gr.HTML()
+
+                    ask_button.click(
+                        fn=ask_scholar_lens,
+                        inputs=question_input,
+                        outputs=[answer_output, references_output],
+                        show_progress="full",
+                    )
+                    question_input.submit(
+                        fn=ask_scholar_lens,
+                        inputs=question_input,
+                        outputs=[answer_output, references_output],
+                        show_progress="full",
+                    )
+
                 with gr.Tab("🔍  Search", id="search"):
                     with gr.Row():
                         query_input = gr.Textbox(
@@ -682,28 +980,52 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     status_output = gr.Markdown("Ready for search.", elem_classes=["status-line"])
                     results_output = gr.HTML(_render_results_table([]))
 
+                    with gr.Row(elem_classes=["page-row"]):
+                        prev_button = gr.Button("← Prev", scale=0, min_width=100)
+                        page_label = gr.Markdown("", elem_classes=["page-label"])
+                        next_button = gr.Button("Next →", scale=0, min_width=100)
+
                     with gr.Row(elem_classes=["action-row"]):
+                        paper_selector = gr.Dropdown(
+                            label="Select a paper to summarize",
+                            choices=[],
+                            type="index",
+                            interactive=True,
+                            scale=4,
+                        )
                         with gr.Column(scale=1):
                             summarize_selected_button = gr.Button("✨ Summarize Now", variant="primary")
 
+                    search_outputs = [
+                        status_output,
+                        results_output,
+                        papers_state,
+                        paper_selector,
+                        page_label,
+                        page_state,
+                    ]
                     search_button.click(
                         fn=search_all_sources,
                         inputs=query_input,
-                        outputs=[status_output, results_output, papers_state, selected_index_state],
+                        outputs=search_outputs,
                         show_progress="full",
                     )
                     query_input.submit(
                         fn=search_all_sources,
                         inputs=query_input,
-                        outputs=[status_output, results_output, papers_state, selected_index_state],
+                        outputs=search_outputs,
                         show_progress="full",
                     )
-                    
-                    # JS row selection logic
-                    hidden_select_btn.click(
-                        fn=lambda x: int(x) if x else None,
-                        inputs=hidden_index_input,
-                        outputs=selected_index_state
+
+                    prev_button.click(
+                        fn=lambda results, page: change_page(results, page, -1),
+                        inputs=[papers_state, page_state],
+                        outputs=[results_output, page_label, page_state],
+                    )
+                    next_button.click(
+                        fn=lambda results, page: change_page(results, page, 1),
+                        inputs=[papers_state, page_state],
+                        outputs=[results_output, page_label, page_state],
                     )
 
                 with gr.Tab("✨  Summarize", id="summarize"):
@@ -720,9 +1042,11 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         show_progress="full",
                     )
                     
+                    # Native dropdown selection (type="index" gives the chosen
+                    # paper's index directly) — no JS, no race conditions.
                     summarize_selected_button.click(
                         fn=summarize_selected_paper,
-                        inputs=[selected_index_state, papers_state],
+                        inputs=[paper_selector, papers_state],
                         outputs=[source_text, load_status_output, summary_output, app_tabs],
                         show_progress="full",
                     )
@@ -737,12 +1061,21 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                                 built to accelerate literature reviews and research synthesis.
                             </p>
                             <p>
-                                It performs real-time searches across <strong>Semantic Scholar</strong>, 
-                                <strong>arXiv</strong>, and <strong>PubMed</strong> using parallel processing, 
-                                then distills findings using a high-performance LLM hosted on Modal.
+                                It performs real-time searches across <strong>OpenAlex</strong>,
+                                <strong>Crossref</strong>, <strong>arXiv</strong>, and <strong>PubMed</strong>
+                                using parallel processing, then uses a small open language model
+                                (<strong>Qwen2.5-7B</strong>, hosted on Modal) to do the heavy lifting.
                             </p>
-                            <p style="margin-top: 20px; font-size: 13px; color: var(--sl-accent-bright);">
-                                Background: #0f172a | Accent: #3b82f6 | V2.0
+                            <p>
+                                In the <strong>Ask</strong> tab the model answers your research
+                                question with a synthesized, <strong>cited</strong> response grounded
+                                only in the retrieved abstracts &mdash; so it compares findings across
+                                papers without inventing sources. The <strong>Summarize</strong> tab
+                                condenses any single paper or pasted text.
+                            </p>
+                            <p style="margin-top: 16px; font-size: 13px; color: var(--sl-muted);">
+                                Built for the Hugging Face <em>Build Small</em> hackathon &middot;
+                                model &le; 32B parameters.
                             </p>
                         </div>
                         """
@@ -750,7 +1083,16 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
             
             clear_button.click(
                 fn=clear_search,
-                outputs=[status_output, results_output, papers_state, selected_index_state, source_text, summary_output],
+                outputs=[
+                    status_output,
+                    results_output,
+                    papers_state,
+                    paper_selector,
+                    page_label,
+                    page_state,
+                    source_text,
+                    summary_output,
+                ],
             )
 
     return app, theme
@@ -765,4 +1107,5 @@ if __name__ == "__main__":
         server_port=7860,
         theme=theme,
         css=CUSTOM_CSS,
+        head=HEAD_SCRIPT,
     )

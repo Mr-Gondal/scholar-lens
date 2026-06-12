@@ -12,15 +12,16 @@ license: mit
 
 # Scholar Lens
 
-Scholar Lens is a Gradio research assistant for searching papers across Semantic Scholar, arXiv, and PubMed from one focused interface. It normalizes results into a clean table, lets users select a paper, and sends the title plus abstract directly to an AI summarizer hosted on Modal.
+Scholar Lens is a Gradio research assistant for searching papers across OpenAlex, Crossref, arXiv, and PubMed from one focused interface. It normalizes and de-duplicates results into a clean table, lets users select a paper, and sends the title plus abstract to a small open language model (Qwen2.5-7B) hosted on Modal.
 
 ## Features
 
-- Search Semantic Scholar, arXiv, and PubMed with one query.
+- **Ask (grounded Q&A):** ask a research question; the app searches all four sources and a small open model writes a synthesized, **cited** answer grounded only in the retrieved abstracts (no invented sources).
+- Search OpenAlex, Crossref, arXiv, and PubMed with one query.
+- De-duplicates results across sources by DOI, then normalized title.
 - View normalized paper metadata: title, year, source, authors, citations, and abstract availability.
 - Select a search result and load it into the Summarize tab.
 - Summarize selected papers or pasted abstracts with a Modal-hosted language model.
-- Clear search results and reset the summarization workspace.
 - Professional dark Gradio interface with responsive result tables and source badges.
 
 ## Codex Track
@@ -54,8 +55,17 @@ python app.py
 
 The app launches a local Gradio server and prints the URL in the terminal.
 
-## Modal Summarizer
+## Modal Inference
 
-`modal_inference.py` defines a Modal FastAPI endpoint backed by `Qwen/Qwen2.5-7B-Instruct`. The Gradio app posts paper text to the deployed Modal endpoint configured in `MODAL_SUMMARIZE_URL`.
+`modal_inference.py` defines a Modal class backed by `Qwen/Qwen2.5-7B-Instruct` (a small, ≤32B open model). The model is loaded once per container via `@modal.enter()` and kept warm, then exposed through two FastAPI endpoints:
 
-If you deploy your own Modal endpoint, update `MODAL_SUMMARIZE_URL` in `app.py`.
+- `summarize_paper` — condenses a single abstract or pasted text (`MODAL_SUMMARIZE_URL`).
+- `synthesize` — answers a question grounded in numbered abstracts, with `[n]` citations (`MODAL_SYNTHESIZE_URL`).
+
+Deploy with:
+
+```bash
+modal deploy modal_inference.py
+```
+
+If you deploy your own endpoints, update `MODAL_SUMMARIZE_URL` and `MODAL_SYNTHESIZE_URL` in `app.py` to match the URLs Modal prints.

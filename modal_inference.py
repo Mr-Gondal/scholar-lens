@@ -2,7 +2,7 @@ import modal
 
 app = modal.App("scholar-lens-summarizer")
 
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -18,7 +18,7 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="T4",
+    gpu="A100",
     timeout=300,
     # Keep the container (and the loaded model) warm for 5 minutes after the
     # last request so repeat calls don't pay the cold-start cost again.
@@ -86,3 +86,34 @@ class Summarizer:
         except Exception as exc:  # surface errors to the client instead of 500s
             return {"error": f"Generation failed: {exc}"}
         return {"summary": summary}
+
+    @modal.fastapi_endpoint(method="POST", label="scholar-lens-summarizer-synthesize")
+    def synthesize(self, data: dict) -> dict:
+        """Answer a research question grounded ONLY in the supplied abstracts.
+
+        Expects ``{"question": str, "context": str}`` where ``context`` is a
+        block of numbered papers ([1], [2], ...). The model must cite those
+        numbers, which keeps it from inventing sources.
+        """
+        question = (data or {}).get("question", "")
+        context = (data or {}).get("context", "")
+        if not question or not context:
+            return {"error": "Both 'question' and 'context' are required."}
+
+        prompt = (
+            "You are a meticulous research assistant. Using ONLY the numbered "
+            "paper abstracts below, write a clear, synthesized answer to the "
+            "question. Compare and contrast the findings where relevant. Cite "
+            "every claim with the matching source number in square brackets, "
+            "e.g. [1] or [2][3]. If the abstracts do not contain enough "
+            "information to answer, say so plainly. Never invent sources or "
+            "facts that are not in the abstracts.\n\n"
+            f"{context}\n\n"
+            f"Question: {question}\n\n"
+            "Synthesized answer (with [n] citations):"
+        )
+        try:
+            answer = self._generate(prompt, max_new_tokens=450)
+        except Exception as exc:
+            return {"error": f"Generation failed: {exc}"}
+        return {"answer": answer}
