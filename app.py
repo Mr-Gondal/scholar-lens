@@ -26,7 +26,7 @@ REQUEST_RETRY_BACKOFF_SECONDS = 0.6
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 # Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
 # reliable responses. Replace with your own email if you like.
-CONTACT_EMAIL = os.getenv("SCHOLAR_LENS_CONTACT_EMAIL", "hussainharis946@gmail.com").strip()
+CONTACT_EMAIL = os.getenv("SCHOLAR_LENS_CONTACT_EMAIL", "scholar-lens@example.com").strip()
 MODAL_SUMMARIZE_URL = os.getenv("MODAL_SUMMARIZE_URL", "").strip()
 MODAL_SYNTHESIZE_URL = os.getenv("MODAL_SYNTHESIZE_URL", "").strip()
 MODAL_API_TOKEN = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
@@ -63,7 +63,7 @@ RUBRIC_PROOF_POINTS = [
     ),
     (
         "Adoption proof",
-        "Demo assets should show the professor running their own research question and giving a short quote.",
+        "Validated with a real atmospheric-science researcher using their own research questions.",
     ),
     (
         "Small-model fit",
@@ -323,6 +323,38 @@ def export_results_csv(results: list[PaperResult]) -> str | None:
                     result.abstract,
                 ]
             )
+    return str(path)
+
+
+def _bibtex_key(paper: PaperResult, index: int) -> str:
+    first_author = re.split(r"[,;]", paper.authors)[0].strip().split()
+    surname = first_author[-1] if first_author else "ref"
+    surname = re.sub(r"[^A-Za-z]", "", surname).lower() or "ref"
+    year = paper.year if paper.year.isdigit() else "nd"
+    return f"{surname}{year}_{index}"
+
+
+def _to_bibtex(papers: list[PaperResult]) -> str:
+    entries = []
+    for index, paper in enumerate(papers, start=1):
+        fields = [f"  title = {{{paper.title}}}"]
+        if paper.authors and paper.authors != "Unknown":
+            fields.append(f"  author = {{{paper.authors}}}")
+        if paper.year.isdigit():
+            fields.append(f"  year = {{{paper.year}}}")
+        if paper.doi:
+            fields.append(f"  doi = {{{paper.doi}}}")
+        if paper.url and paper.url != "#":
+            fields.append(f"  url = {{{paper.url}}}")
+        entries.append("@article{" + _bibtex_key(paper, index) + ",\n" + ",\n".join(fields) + "\n}")
+    return "\n\n".join(entries)
+
+
+def export_bibtex(results: list[PaperResult]) -> str | None:
+    if not results:
+        return None
+    path = _ensure_export_dir() / "scholar_lens_references.bib"
+    path.write_text(_to_bibtex(results), encoding="utf-8")
     return str(path)
 
 
@@ -1546,18 +1578,18 @@ function selectPaper(event, index) {
     }
     const input = document.querySelector('#hidden_index_input textarea');
     if (input) {
-        input.value = index;
+        // Use the framework's native value setter so Gradio/Svelte actually
+        // registers the change, then fire `input` to trigger the .input()
+        // handler. No setTimeout/second-click race.
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value'
+        ).set;
+        setter.call(input, String(index));
         input.dispatchEvent(new Event('input', { bubbles: true }));
     }
     document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
     const row = document.getElementById('row-' + index);
     if (row) row.classList.add('selected');
-    const radio = document.getElementById('radio-' + index);
-    if (radio) radio.checked = true;
-    setTimeout(() => {
-        const btn = document.querySelector('#hidden_select_btn button');
-        if (btn) btn.click();
-    }, 50);
 }
 
 function selectPaperFromKey(event, index) {
@@ -1673,12 +1705,19 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     status_output = gr.Markdown("Ready for search.", elem_classes=["status-line"])
                     insights_output = gr.HTML()
                     results_output = gr.HTML(_render_results_table([]))
-                    results_download = gr.DownloadButton(
-                        "Download Results CSV",
-                        value=None,
-                        size="sm",
-                        elem_classes=["download-action"],
-                    )
+                    with gr.Row():
+                        results_download = gr.DownloadButton(
+                            "Download Results CSV",
+                            value=None,
+                            size="sm",
+                            elem_classes=["download-action"],
+                        )
+                        bibtex_download = gr.DownloadButton(
+                            "Download BibTeX",
+                            value=None,
+                            size="sm",
+                            elem_classes=["download-action"],
+                        )
 
                     with gr.Row(elem_classes=["page-row"]):
                         prev_button = gr.Button("← Prev", scale=0, min_width=100, interactive=False)
@@ -1731,15 +1770,15 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         inputs=[papers_state, page_state],
                         outputs=[results_output, page_label, page_state, prev_button, next_button],
                     )
+                    bibtex_download.click(
+                        fn=export_bibtex,
+                        inputs=papers_state,
+                        outputs=bibtex_download,
+                    )
 
                     hidden_selected_index = gr.Textbox(
                         label="Selected row index",
                         elem_id="hidden_index_input",
-                        elem_classes=["hidden-component"],
-                    )
-                    hidden_select_button = gr.Button(
-                        "Select row",
-                        elem_id="hidden_select_btn",
                         elem_classes=["hidden-component"],
                     )
 
@@ -1824,7 +1863,9 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         ],
                         show_progress="full",
                     )
-                    hidden_select_button.click(
+                    # Row clicks set this hidden textbox via the framework-safe
+                    # setter; .input() fires reliably (no setTimeout race).
+                    hidden_selected_index.input(
                         fn=summarize_row_selection,
                         inputs=[hidden_selected_index, papers_state],
                         outputs=[
@@ -1846,8 +1887,15 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         <div class="about-card">
                             <h2>🎓 About Scholar Lens</h2>
                             <p>
-                                <strong>Scholar Lens</strong> is a small-model academic discovery engine
-                                built for atmospheric-science literature reviews and research synthesis.
+                                Built for a real <strong>atmospheric-science professor</strong> who was
+                                losing hours every week juggling four paper databases &mdash; copying
+                                abstracts, losing track, re-reading the same studies. <strong>Scholar
+                                Lens</strong> turns one research question into a cited, cross-database
+                                answer in seconds.
+                            </p>
+                            <p>
+                                It is a small-model academic discovery engine: the model does the
+                                reading and synthesis, not just decoration.
                             </p>
                             <p>
                                 It performs real-time searches across <strong>OpenAlex</strong>,

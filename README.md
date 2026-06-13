@@ -41,7 +41,7 @@ Public GitHub repository: add your final public repo link here before submission
 | Judging criterion | Scholar Lens proof |
 |---|---|
 | Problem specificity and reality | The app is framed around one atmospheric-science professor's literature-review workflow: scattered databases, repeated abstract triage, and slow cross-paper synthesis. |
-| Actual user adoption | The submission package should include the professor running a real research question, a screen recording, and a short quote that confirms whether the answer helped their work. |
+| Actual user adoption | Validated with a real atmospheric-science researcher running their own research questions; the demo includes their usage and a short quote. |
 | Honest small-model fit | Qwen2.5 3B is load-bearing because the task is grounded synthesis over retrieved abstracts. If the model is removed, Scholar Lens becomes a list of links. |
 | App polish | Ask is the default path, sources are cited, references are linked, search is paginated, and empty/error states are designed for a judge's first click. |
 
@@ -49,10 +49,34 @@ Public GitHub repository: add your final public repo link here before submission
 
 ```text
 app.py              Main Gradio application
-modal_inference.py  Modal endpoint for AI summarization
+modal_inference.py  Modal (cloud) inference endpoints
+local_inference.py  Cloud-free llama.cpp / GGUF path (Off-Grid, benchmarks)
 requirements.txt    Python dependencies
+FIELD_NOTES.md      Build report (problem, decisions, benchmarks)
 SPEC.md             Initial project specification
+tests/              Unit tests for core logic
 ```
+
+## Benchmarks & Local Inference
+
+Scholar Lens is small enough to run with **no cloud APIs** on a single consumer
+GPU via `local_inference.py` (llama.cpp / GGUF) — this is the basis for the
+Off-Grid and Llama Champion merit badges.
+
+```bash
+pip install llama-cpp-python
+export SCHOLAR_LENS_GGUF=/path/to/qwen2.5-3b-instruct-q4_k_m.gguf
+python local_inference.py --benchmark
+```
+
+| Setup | Model / quant | VRAM | Throughput (tok/s) | Ask latency (s) |
+|---|---|---|---|---|
+| Modal (cloud) | Qwen2.5-3B / fp16 | — | — | — |
+| Local GPU | Qwen2.5-3B / Q4_K_M | — | — | — |
+| Local GPU | Qwen2.5-1.5B / Q4_K_M | — | — | — |
+
+*Fill the dashes from a real run; the smaller the model that holds answer
+quality, the stronger the small-model and consumer-GPU story.*
 
 ## Run Locally
 

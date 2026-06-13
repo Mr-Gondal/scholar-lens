@@ -12,6 +12,9 @@ app = modal.App("scholar-lens-summarizer")
 
 MODEL_NAME = os.getenv("SCHOLAR_LENS_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 GPU_TYPE = os.getenv("SCHOLAR_LENS_GPU", "L4")
+# Seconds to keep a warm container after the last request. Bump this (e.g.
+# 600) right before recording a demo so the model never cold-starts on camera.
+SCALEDOWN_WINDOW = int(os.getenv("SCHOLAR_LENS_SCALEDOWN", "90"))
 # Keep the context small enough for the 3B model to start quickly and stay
 # honest: Scholar Lens supplies the abstracts, then the model synthesizes them.
 MAX_MODEL_LEN = 8192
@@ -43,7 +46,7 @@ image = (
     gpu=GPU_TYPE,
     timeout=300,
     # Keep warm briefly for live demos without leaving an expensive GPU idle.
-    scaledown_window=90,
+    scaledown_window=SCALEDOWN_WINDOW,
     secrets=[
         modal.Secret.from_name("huggingface"),
         modal.Secret.from_name("scholar-lens-api"),
