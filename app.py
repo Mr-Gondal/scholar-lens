@@ -56,6 +56,24 @@ SAMPLE_QUESTIONS = [
     "What are recent methods for detecting atmospheric rivers?",
     "How do climate models represent urban heat island effects?",
 ]
+RUBRIC_PROOF_POINTS = [
+    (
+        "Real professor workflow",
+        "Built around an atmospheric-science literature-review pain point, not a generic paper search demo.",
+    ),
+    (
+        "Adoption proof",
+        "Demo assets should show the professor running their own research question and giving a short quote.",
+    ),
+    (
+        "Small-model fit",
+        "Qwen2.5 3B only synthesizes retrieved abstracts, so the model is load-bearing without needing broad world knowledge.",
+    ),
+    (
+        "Product polish",
+        "Ask is the default path, with cited answers, source links, pagination, and friendly empty/error states.",
+    ),
+]
 SEARCH_STOPWORDS = {
     "a",
     "about",
@@ -255,6 +273,22 @@ def _render_result_insights(results: list[PaperResult]) -> str:
         for label, value, detail in cards
     )
     return f'<div class="insight-grid">{rendered_cards}</div>'
+
+
+def _render_rubric_proof() -> str:
+    cards = "".join(
+        '<div class="proof-card">'
+        f"<strong>{html.escape(title)}</strong>"
+        f"<span>{html.escape(description)}</span>"
+        "</div>"
+        for title, description in RUBRIC_PROOF_POINTS
+    )
+    return (
+        '<section class="proof-section">'
+        "<h3>Backyard AI proof points</h3>"
+        f'<div class="proof-grid">{cards}</div>'
+        "</section>"
+    )
 
 
 def _abstract_snippet(text: str, max_chars: int = 220) -> str:
@@ -1425,6 +1459,37 @@ CUSTOM_CSS = """
     line-height: 1.65;
 }
 .about-card h2 { margin-top: 0; color: var(--sl-text-bright); }
+.proof-section {
+    margin-top: 18px;
+    padding-top: 18px;
+    border-top: 1px solid var(--sl-border-soft);
+}
+.proof-section h3 {
+    margin: 0 0 12px;
+    color: var(--sl-text-bright);
+    font-size: 15px;
+}
+.proof-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+}
+.proof-card {
+    border: 1px solid var(--sl-border-soft);
+    border-radius: 8px;
+    padding: 12px;
+    background: rgba(15, 23, 42, 0.38);
+}
+.proof-card strong {
+    display: block;
+    color: var(--sl-accent-bright);
+    margin-bottom: 5px;
+}
+.proof-card span {
+    color: var(--sl-muted);
+    font-size: 13px;
+    line-height: 1.45;
+}
 .download-action { margin-top: 8px; }
 
 /* ===== ASK / SYNTHESIS ===== */
@@ -1777,7 +1842,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
 
                 with gr.Tab("📖  About"):
                     gr.HTML(
-                        """
+                        f"""
                         <div class="about-card">
                             <h2>🎓 About Scholar Lens</h2>
                             <p>
@@ -1801,6 +1866,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                                 Built for the Hugging Face <em>Build Small</em> hackathon &middot;
                                 model small enough for the consumer-GPU story.
                             </p>
+                            {_render_rubric_proof()}
                         </div>
                         """
                     )

@@ -119,6 +119,13 @@ class AppCoreTests(unittest.TestCase):
             app._pubmed_search_query("cancer detection with MRI"),
         )
 
+    def test_rubric_proof_panel_mentions_judging_evidence(self):
+        panel = app._render_rubric_proof()
+
+        self.assertIn("Backyard AI proof points", panel)
+        self.assertIn("Real professor workflow", panel)
+        self.assertIn("Small-model fit", panel)
+
     def test_load_selected_paper_returns_context(self):
         item = paper("Useful Paper", abstract="A clear abstract about useful results.")
 

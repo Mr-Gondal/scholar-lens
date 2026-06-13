@@ -36,6 +36,15 @@ Hackathon pitch: Scholar Lens turns a research question into a cited, cross-data
 
 Public GitHub repository: add your final public repo link here before submission.
 
+## Backyard AI Rubric Fit
+
+| Judging criterion | Scholar Lens proof |
+|---|---|
+| Problem specificity and reality | The app is framed around one atmospheric-science professor's literature-review workflow: scattered databases, repeated abstract triage, and slow cross-paper synthesis. |
+| Actual user adoption | The submission package should include the professor running a real research question, a screen recording, and a short quote that confirms whether the answer helped their work. |
+| Honest small-model fit | Qwen2.5 3B is load-bearing because the task is grounded synthesis over retrieved abstracts. If the model is removed, Scholar Lens becomes a list of links. |
+| App polish | Ask is the default path, sources are cited, references are linked, search is paginated, and empty/error states are designed for a judge's first click. |
+
 ## Project Structure
 
 ```text
