@@ -10,12 +10,12 @@ from fastapi import Header, HTTPException
 
 app = modal.App("scholar-lens-summarizer")
 
-MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-GPU_TYPE = "A100-80GB"
-# Keep the demo context far below the model's 128k maximum so vLLM reserves
-# less KV-cache memory and the endpoint starts more predictably.
-MAX_MODEL_LEN = 32768
-MAX_PROMPT_TOKENS = 24000
+MODEL_NAME = os.getenv("SCHOLAR_LENS_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+GPU_TYPE = os.getenv("SCHOLAR_LENS_GPU", "L4")
+# Keep the context small enough for the 3B model to start quickly and stay
+# honest: Scholar Lens supplies the abstracts, then the model synthesizes them.
+MAX_MODEL_LEN = 8192
+MAX_PROMPT_TOKENS = 7000
 SUMMARY_INPUT_CHAR_LIMIT = 60000
 SUMMARY_INPUT_TOKEN_LIMIT = 15000
 SUMMARY_CHUNK_TOKEN_LIMIT = 3500
@@ -31,7 +31,6 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "vllm>=0.8.1",
-        "mistral_common>=1.5.4",
         "fastapi[standard]",
     )
 )
@@ -39,8 +38,8 @@ image = (
 
 @app.cls(
     image=image,
-    # Mistral Small 3.1 24B needs substantial VRAM in bf16/fp16. Use this
-    # only for short judge demos, then move back down when the review is over.
+    # Qwen2.5 3B keeps the small-model story load-bearing and deploys on a
+    # modest GPU; override SCHOLAR_LENS_GPU for benchmark runs.
     gpu=GPU_TYPE,
     timeout=300,
     # Keep warm briefly for live demos without leaving an expensive GPU idle.
@@ -58,9 +57,6 @@ class Summarizer:
 
         self.model = LLM(
             model=MODEL_NAME,
-            tokenizer_mode="mistral",
-            config_format="mistral",
-            load_format="mistral",
             max_model_len=MAX_MODEL_LEN,
             gpu_memory_utilization=0.90,
         )

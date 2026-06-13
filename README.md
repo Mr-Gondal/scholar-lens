@@ -12,11 +12,14 @@ license: mit
 
 # Scholar Lens
 
-Scholar Lens is a Gradio research assistant for searching papers across OpenAlex, Crossref, arXiv, and PubMed from one focused interface. It normalizes and de-duplicates results into a clean table, lets users select a paper, and sends the title plus abstract to a strong open language model (Mistral Small 3.1 24B) hosted on Modal.
+Scholar Lens turns a research question into a cited, cross-database answer using a model small enough to run on a single consumer GPU. It is built for an atmospheric-science professor who needs to triage papers across OpenAlex, Crossref, arXiv, and PubMed without copying abstracts between tools.
+
+The app normalizes and de-duplicates results into a clean table, lets users inspect or summarize individual papers, and uses `Qwen/Qwen2.5-3B-Instruct` on Modal for grounded synthesis over retrieved abstracts.
 
 ## Features
 
-- **Ask (grounded Q&A):** ask a research question; the app searches all four sources and a 24B open model writes a synthesized, **cited** answer grounded only in the retrieved abstracts (no invented sources).
+- **Ask (grounded Q&A):** ask a research question; the app searches all four sources and Qwen2.5 3B writes a synthesized, **cited** answer grounded only in the retrieved abstracts (no invented sources).
+- Atmospheric-science starter questions for aerosol-cloud interactions, satellite precipitation, atmospheric rivers, and urban heat islands.
 - Search OpenAlex, Crossref, arXiv, and PubMed with one query.
 - De-duplicates results across sources by DOI, then normalized title.
 - View normalized paper metadata: title, year, source, authors, citations, and abstract availability.
@@ -27,7 +30,9 @@ Scholar Lens is a Gradio research assistant for searching papers across OpenAlex
 
 ## Codex Track
 
-This project was built with OpenAI Codex as the coding agent.
+This project was built with OpenAI Codex as the coding agent. The commit history is intentionally small and reviewable so the build process can be evaluated alongside the app.
+
+Hackathon pitch: Scholar Lens turns a research question into a cited, cross-database answer using a model small enough to run on a single consumer GPU, built for a real atmospheric-science researcher who was drowning in literature review.
 
 Public GitHub repository: add your final public repo link here before submission.
 
@@ -73,7 +78,7 @@ python -B -m unittest discover -s tests -v
 
 ## Modal Inference
 
-`modal_inference.py` defines a Modal class backed by `mistralai/Mistral-Small-3.1-24B-Instruct-2503` (a 24B, <=32B open model). The model is loaded once per container via `@modal.enter()` and kept warm briefly for demos, then exposed through two FastAPI endpoints:
+`modal_inference.py` defines a Modal class backed by `Qwen/Qwen2.5-3B-Instruct` by default. The model is loaded once per container via `@modal.enter()` and kept warm briefly for demos, then exposed through two FastAPI endpoints:
 
 - `summarize_paper` — condenses a single abstract or pasted text (`MODAL_SUMMARIZE_URL`).
 - `synthesize` — answers a question grounded in numbered abstracts, with `[n]` citations (`MODAL_SYNTHESIZE_URL`).
@@ -82,6 +87,13 @@ Create a shared API token and store the same value in both places:
 
 - In your Gradio/Hugging Face Space environment: `SCHOLAR_LENS_MODAL_TOKEN`.
 - In Modal, create a secret named `scholar-lens-api` with `SCHOLAR_LENS_MODAL_TOKEN`.
+
+Optional Modal configuration:
+
+```text
+SCHOLAR_LENS_MODEL=Qwen/Qwen2.5-3B-Instruct
+SCHOLAR_LENS_GPU=L4
+```
 
 Deploy with:
 

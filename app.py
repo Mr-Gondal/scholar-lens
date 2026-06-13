@@ -51,10 +51,10 @@ TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 FUZZY_TITLE_THRESHOLD = 0.94
 EXPORT_DIR = Path(tempfile.gettempdir()) / "scholar-lens-exports"
 SAMPLE_QUESTIONS = [
-    "How is AI being used for early cancer detection?",
-    "What are recent methods for battery degradation prediction?",
-    "Where do papers disagree on retrieval-augmented generation?",
-    "What are the main approaches to early Alzheimer's detection from MRI?",
+    "Where do papers disagree on aerosol-cloud interaction uncertainty?",
+    "How is machine learning improving satellite precipitation estimates?",
+    "What are recent methods for detecting atmospheric rivers?",
+    "How do climate models represent urban heat island effects?",
 ]
 SEARCH_STOPWORDS = {
     "a",
@@ -1528,7 +1528,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         <div class="crest">🔬</div>
                         <div class="header-text">
                             <h1>Scholar <span class="accent">Lens</span></h1>
-                            <p>Professional Research Discovery & Synthesis Engine</p>
+                            <p>Small-model literature review for atmospheric science</p>
                             <div class="header-chips">
                                 <span class="header-chip">OpenAlex</span>
                                 <span class="header-chip">Crossref</span>
@@ -1548,8 +1548,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                 with gr.Tab("💬  Ask", id="ask"):
                     gr.Markdown(
                         "Ask a research question. Scholar Lens searches **OpenAlex, "
-                        "Crossref, arXiv, and PubMed**, then a 24B open model "
-                        "(Mistral Small 3.1) writes a synthesized, **cited** answer grounded "
+                        "Crossref, arXiv, and PubMed**, then Qwen2.5 3B writes "
+                        "a synthesized, **cited** answer grounded "
                         "only in the retrieved abstracts.",
                         elem_classes=["ask-intro"],
                     )
@@ -1781,14 +1781,14 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         <div class="about-card">
                             <h2>🎓 About Scholar Lens</h2>
                             <p>
-                                <strong>Scholar Lens</strong> is a professional academic discovery engine
-                                built to accelerate literature reviews and research synthesis.
+                                <strong>Scholar Lens</strong> is a small-model academic discovery engine
+                                built for atmospheric-science literature reviews and research synthesis.
                             </p>
                             <p>
                                 It performs real-time searches across <strong>OpenAlex</strong>,
                                 <strong>Crossref</strong>, <strong>arXiv</strong>, and <strong>PubMed</strong>
-                                using parallel processing, then uses a 24B open language model
-                                (<strong>Mistral Small 3.1</strong>, hosted on Modal) to do the heavy lifting.
+                                using parallel processing, then uses <strong>Qwen2.5 3B</strong>,
+                                hosted on Modal, to do the heavy lifting.
                             </p>
                             <p>
                                 In the <strong>Ask</strong> tab the model answers your research
@@ -1799,7 +1799,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             </p>
                             <p style="margin-top: 16px; font-size: 13px; color: var(--sl-muted);">
                                 Built for the Hugging Face <em>Build Small</em> hackathon &middot;
-                                model &le; 32B parameters.
+                                model small enough for the consumer-GPU story.
                             </p>
                         </div>
                         """
