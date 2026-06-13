@@ -137,9 +137,11 @@ class Summarizer:
         chunks = self._chunk_summary_text(text)
         if len(chunks) <= 1:
             prompt = (
-                "Summarize the following research paper abstract in 4-5 clear "
-                "sentences. Focus on the main contribution and the key results.\n\n"
-                f"Abstract:\n{text}"
+                "Summarize the following research paper context in 4-6 clear "
+                "sentences. Cover the main contribution, methods, and key "
+                "results/findings. If a Results / Findings section is present, "
+                "use it as stronger evidence than the abstract.\n\n"
+                f"Paper context:\n{text}"
             )
             return self._generate(prompt, max_new_tokens=250)
 
@@ -147,7 +149,7 @@ class Summarizer:
         for index, chunk in enumerate(chunks, start=1):
             prompt = (
                 "Summarize this section of a research paper in 2-3 concise "
-                "sentences. Preserve concrete methods, findings, and limitations.\n\n"
+                "sentences. Preserve concrete methods, results/findings, and limitations.\n\n"
                 f"Section {index} of {len(chunks)}:\n{chunk}"
             )
             chunk_summaries.append(self._generate(prompt, max_new_tokens=180))
@@ -159,7 +161,7 @@ class Summarizer:
         final_prompt = (
             "Combine the section summaries below into one coherent 4-6 sentence "
             "summary of the paper. Avoid repetition and focus on the main "
-            "contribution, methods, results, and limitations.\n\n"
+            "contribution, methods, results/findings, and limitations.\n\n"
             f"{combined}"
         )
         return self._generate(final_prompt, max_new_tokens=280)

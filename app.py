@@ -46,6 +46,7 @@ SYNTHESIS_CONTEXT_CHAR_LIMIT = 28000
 SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
 DEFAULT_LOAD_STATUS = "Select a paper to summarize."
+DEFAULT_PAPER_CHAT_ANSWER = "Ask a question about the selected or pasted paper."
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 FUZZY_TITLE_THRESHOLD = 0.94
 EXPORT_DIR = Path(tempfile.gettempdir()) / "scholar-lens-exports"
@@ -291,19 +292,62 @@ def export_results_csv(results: list[PaperResult]) -> str | None:
     return str(path)
 
 
-def export_summary_markdown(source_text: str, summary: str) -> str | None:
-    if not source_text.strip() and not summary.strip():
+def export_summary_markdown(source_text: str, results_text: str, summary: str) -> str | None:
+    if not source_text.strip() and not results_text.strip() and not summary.strip():
         return None
     path = _ensure_export_dir() / "scholar_lens_summary.md"
     path.write_text(
         "# Scholar Lens Summary\n\n"
         "## Source Context\n\n"
         f"{source_text.strip() or '_No source context provided._'}\n\n"
+        "## Results / Findings\n\n"
+        f"{results_text.strip() or '_No results/findings section provided._'}\n\n"
         "## AI Summary\n\n"
         f"{summary.strip() or '_No summary generated yet._'}\n",
         encoding="utf-8",
     )
     return str(path)
+
+
+def _combine_paper_context(source_text: str, results_text: str = "") -> str:
+    parts = []
+    if source_text and source_text.strip():
+        parts.append(source_text.strip())
+    if results_text and results_text.strip():
+        parts.append(f"Results / Findings:\n{results_text.strip()}")
+    return "\n\n".join(parts)
+
+
+def summarize_paper_context(source_text: str, results_text: str) -> str:
+    return summarize_with_modal(_combine_paper_context(source_text, results_text))
+
+
+def chat_about_paper(source_text: str, results_text: str, question: str) -> str:
+    clean_question = (question or "").strip()
+    context = _combine_paper_context(source_text, results_text)
+    if not context.strip():
+        return "Load a paper or paste paper text before asking a question."
+    if not clean_question:
+        return "Ask a specific question about the paper."
+    limit_error = _text_limit_error(
+        clean_question,
+        "Paper question",
+        ASK_QUESTION_CHAR_LIMIT,
+        ASK_QUESTION_TOKEN_LIMIT,
+    )
+    if limit_error:
+        return limit_error
+    context = _trim_to_budget(
+        context,
+        SYNTHESIS_CONTEXT_CHAR_LIMIT,
+        SYNTHESIS_CONTEXT_TOKEN_LIMIT,
+    )
+    prompt_question = (
+        f"{clean_question}\n\n"
+        "Answer using only this paper context. If the answer depends on the "
+        "results/findings section and it is not present, say that clearly."
+    )
+    return synthesize_with_modal(prompt_question, f"[1] Paper context:\n{context}")
 
 
 def ask_example(question: str) -> tuple[str, str, str]:
@@ -773,7 +817,10 @@ def search_all_sources(query: str):
         status = f"✓ Found **{len(results)}** papers across all sources."
 
     if not results:
-        status = "No papers found. Try a broader research topic or a different phrase."
+        if warnings:
+            status = "No papers could be loaded because the source APIs are unavailable right now. " + " ".join(warnings)
+        else:
+            status = "No papers found. Try a broader research topic or a different phrase."
 
     table, label, page = _page_view(results, 0)
     prev_update, next_update = _pagination_updates(results, page)
@@ -1068,7 +1115,7 @@ def summarize_selected_paper(
 def summarize_row_selection(
     selected_index: Any,
     results: list[PaperResult],
-) -> tuple[str, str, str, gr.Tabs, gr.Dropdown]:
+) -> tuple[str, str, str, gr.Tabs, gr.Dropdown, str, str, str]:
     paper_text, load_status, summary, tab_update = summarize_selected_paper(
         selected_index,
         results,
@@ -1083,7 +1130,21 @@ def summarize_row_selection(
         summary,
         tab_update,
         gr.update(value=dropdown_value),
+        "",
+        "",
+        DEFAULT_PAPER_CHAT_ANSWER,
     )
+
+
+def summarize_selected_paper_reset_chat(
+    selected_index: Any,
+    results: list[PaperResult],
+) -> tuple[str, str, str, gr.Tabs, str, str, str]:
+    paper_text, load_status, summary, tab_update = summarize_selected_paper(
+        selected_index,
+        results,
+    )
+    return paper_text, load_status, summary, tab_update, "", "", DEFAULT_PAPER_CHAT_ANSWER
 
 
 def clear_search():
@@ -1109,6 +1170,9 @@ def clear_search():
         DEFAULT_LOAD_STATUS,
         "",
         None,
+        "",
+        "",
+        DEFAULT_PAPER_CHAT_ANSWER,
     )
 
 
@@ -1315,6 +1379,14 @@ CUSTOM_CSS = """
 .insight-card strong { color: var(--sl-text-bright); font-size: 20px; line-height: 1.1; }
 .insight-card small { color: var(--sl-muted); font-size: 12px; }
 .action-row { align-items: end; gap: 12px; }
+.gradio-container [role="option"] {
+    color: rgb(10, 20, 252) !important;
+}
+.gradio-container [role="option"]:hover,
+.gradio-container [role="option"][aria-selected="true"] {
+    color: rgb(10, 20, 252) !important;
+    font-weight: 700 !important;
+}
 .action-cell {
     display: flex;
     gap: 8px;
@@ -1610,8 +1682,15 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     with gr.Column(elem_classes=["summarize-panel"]):
                         load_status_output = gr.Markdown(DEFAULT_LOAD_STATUS)
                         source_text = gr.Textbox(
-                            label="Paper Context",
+                            label="Paper Context / Abstract",
                             lines=10,
+                            max_length=SUMMARY_INPUT_CHAR_LIMIT,
+                            buttons=["copy"],
+                        )
+                        results_text = gr.Textbox(
+                            label="Results / Findings Section (optional)",
+                            placeholder="Paste the paper's results, findings, discussion, or conclusion section here when available.",
+                            lines=6,
                             max_length=SUMMARY_INPUT_CHAR_LIMIT,
                             buttons=["copy"],
                         )
@@ -1628,25 +1707,56 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             size="sm",
                             elem_classes=["download-action"],
                         )
+                        chat_question = gr.Textbox(
+                            label="Talk with AI about this paper",
+                            placeholder="Ask about methods, assumptions, findings, limitations, or what the results mean.",
+                            lines=2,
+                            max_length=ASK_QUESTION_CHAR_LIMIT,
+                        )
+                        chat_button = gr.Button("Ask About Paper", variant="primary")
+                        chat_output = gr.Markdown(
+                            DEFAULT_PAPER_CHAT_ANSWER,
+                            elem_classes=["answer-card"],
+                        )
 
                     summarize_button.click(
-                        fn=summarize_with_modal, 
-                        inputs=source_text, 
+                        fn=summarize_paper_context,
+                        inputs=[source_text, results_text],
                         outputs=summary_output,
                         show_progress="full",
                     )
                     summary_download.click(
                         fn=export_summary_markdown,
-                        inputs=[source_text, summary_output],
+                        inputs=[source_text, results_text, summary_output],
                         outputs=summary_download,
+                    )
+                    chat_button.click(
+                        fn=chat_about_paper,
+                        inputs=[source_text, results_text, chat_question],
+                        outputs=chat_output,
+                        show_progress="full",
+                    )
+                    chat_question.submit(
+                        fn=chat_about_paper,
+                        inputs=[source_text, results_text, chat_question],
+                        outputs=chat_output,
+                        show_progress="full",
                     )
                     
                     # Native dropdown selection (type="index" gives the chosen
                     # paper's index directly) — no JS, no race conditions.
                     summarize_selected_button.click(
-                        fn=summarize_selected_paper,
+                        fn=summarize_selected_paper_reset_chat,
                         inputs=[paper_selector, papers_state],
-                        outputs=[source_text, load_status_output, summary_output, app_tabs],
+                        outputs=[
+                            source_text,
+                            load_status_output,
+                            summary_output,
+                            app_tabs,
+                            results_text,
+                            chat_question,
+                            chat_output,
+                        ],
                         show_progress="full",
                     )
                     hidden_select_button.click(
@@ -1658,6 +1768,9 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             summary_output,
                             app_tabs,
                             paper_selector,
+                            results_text,
+                            chat_question,
+                            chat_output,
                         ],
                         show_progress="full",
                     )
@@ -1706,6 +1819,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     next_button,
                     results_download,
                     source_text,
+                    results_text,
                     summary_output,
                     query_input,
                     question_input,
@@ -1714,6 +1828,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     load_status_output,
                     hidden_selected_index,
                     summary_download,
+                    chat_question,
+                    chat_output,
                 ],
             )
 

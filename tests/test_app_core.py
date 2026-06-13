@@ -66,14 +66,16 @@ class AppCoreTests(unittest.TestCase):
     def test_clear_search_returns_all_reset_outputs(self):
         result = app.clear_search()
 
-        self.assertEqual(len(result), 19)
+        self.assertEqual(len(result), 22)
         self.assertEqual(result[0], "Enter a research topic to begin.")
         self.assertIsNone(result[9])
         self.assertEqual(result[10], "")
         self.assertEqual(result[11], "")
+        self.assertEqual(result[12], "")
         self.assertEqual(result[14], app.DEFAULT_ASK_ANSWER)
         self.assertEqual(result[16], app.DEFAULT_LOAD_STATUS)
         self.assertIsNone(result[18])
+        self.assertEqual(result[21], app.DEFAULT_PAPER_CHAT_ANSWER)
 
     def test_pagination_updates_disable_edges(self):
         papers = [paper(f"Paper {index}") for index in range(app.RESULTS_PER_PAGE + 1)]
@@ -134,6 +136,22 @@ class AppCoreTests(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             content = handle.read()
         self.assertIn("Exportable Paper", content)
+
+    def test_combine_paper_context_includes_results_section(self):
+        context = app._combine_paper_context("Abstract text", "Result text")
+
+        self.assertIn("Abstract text", context)
+        self.assertIn("Results / Findings", context)
+        self.assertIn("Result text", context)
+
+    def test_export_summary_markdown_includes_results(self):
+        path = app.export_summary_markdown("Abstract text", "Result text", "Summary text")
+
+        self.assertIsNotNone(path)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn("Results / Findings", content)
+        self.assertIn("Result text", content)
 
     def test_modal_request_error_uses_response_detail(self):
         response = Mock()
