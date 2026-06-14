@@ -31,9 +31,15 @@ SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    # vLLM/flashinfer may JIT-compile CUDA kernels during warmup. The slim
+    # Debian image lacks nvcc, so use a CUDA devel base with /usr/local/cuda.
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.1-devel-ubuntu22.04",
+        add_python="3.11",
+    )
+    .env({"CUDA_HOME": "/usr/local/cuda"})
     .pip_install(
-        "vllm>=0.8.1",
+        "vllm==0.8.5.post1",
         "fastapi[standard]",
     )
 )
