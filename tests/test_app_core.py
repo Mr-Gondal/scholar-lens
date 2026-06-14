@@ -66,7 +66,7 @@ class AppCoreTests(unittest.TestCase):
     def test_clear_search_returns_all_reset_outputs(self):
         result = app.clear_search()
 
-        self.assertEqual(len(result), 22)
+        self.assertEqual(len(result), 28)
         self.assertEqual(result[0], "Enter a research topic to begin.")
         self.assertIsNone(result[9])
         self.assertEqual(result[10], "")
@@ -76,6 +76,8 @@ class AppCoreTests(unittest.TestCase):
         self.assertEqual(result[16], app.DEFAULT_LOAD_STATUS)
         self.assertIsNone(result[18])
         self.assertEqual(result[21], app.DEFAULT_PAPER_CHAT_ANSWER)
+        self.assertEqual(result[25], app.DEFAULT_COMPARE_ANSWER)
+        self.assertIn("Connectome Constellation", result[26])
 
     def test_pagination_updates_disable_edges(self):
         papers = [paper(f"Paper {index}") for index in range(app.RESULTS_PER_PAGE + 1)]
@@ -169,6 +171,36 @@ class AppCoreTests(unittest.TestCase):
             app._modal_request_error_message(exc, "Modal"),
             "Modal: Bad input",
         )
+
+    def test_get_first_author_accepts_string_or_list(self):
+        self.assertEqual(app.get_first_author("Ada Lovelace, Alan Turing"), "Ada Lovelace")
+        self.assertEqual(app.get_first_author(["Grace Hopper", "Katherine Johnson"]), "Grace Hopper")
+
+    def test_search_result_constellation_marks_keyword_fallback(self):
+        graph = app.build_constellation_from_papers(
+            "connectome",
+            [
+                paper("Functional connectome graph theory", abstract="modularity graph network"),
+                paper("Resting state connectome modularity", abstract="resting fmri modularity"),
+            ],
+        )
+
+        self.assertTrue(graph["data_completeness"]["keyword_fallback_used"])
+        self.assertEqual(graph["data_completeness"]["paper_count"], 2)
+        self.assertIn("nodes", graph)
+
+    def test_export_corpus_zip_includes_graph_json(self):
+        graph = app.build_constellation_from_papers(
+            "connectome",
+            [paper("Functional connectome graph theory", abstract="modularity graph network")],
+        )
+
+        path = app.export_corpus_zip(graph)
+
+        self.assertIsNotNone(path)
+        with app.zipfile.ZipFile(path) as archive:
+            self.assertIn("graph.json", archive.namelist())
+            self.assertIn("data-completeness.json", archive.namelist())
 
 
 if __name__ == "__main__":

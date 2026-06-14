@@ -4,10 +4,14 @@ import html
 import os
 import re
 import csv
+import itertools
+import json
 import textwrap
 import time
 import tempfile
+import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -20,6 +24,8 @@ import requests
 
 APP_TITLE = "Scholar Lens"
 SEARCH_LIMIT_PER_SOURCE = 10
+CONSTELLATION_OPENALEX_LIMIT = 200
+CONSTELLATION_MAX_EDGES = 700
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_RETRY_ATTEMPTS = 3
 REQUEST_RETRY_BACKOFF_SECONDS = 0.6
@@ -47,6 +53,7 @@ SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
 DEFAULT_LOAD_STATUS = "Select a paper to summarize."
 DEFAULT_PAPER_CHAT_ANSWER = "Ask a question about the selected or pasted paper."
+DEFAULT_COMPARE_ANSWER = "Search papers, choose any two, then compare them with AI."
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 FUZZY_TITLE_THRESHOLD = 0.94
 EXPORT_DIR = Path(tempfile.gettempdir()) / "scholar-lens-exports"
@@ -109,6 +116,45 @@ SEARCH_STOPWORDS = {
     "which",
     "with",
 }
+GRAPH_STOPWORDS = SEARCH_STOPWORDS | {
+    "analysis",
+    "based",
+    "brain",
+    "connectivity",
+    "data",
+    "different",
+    "functional",
+    "human",
+    "model",
+    "models",
+    "network",
+    "networks",
+    "paper",
+    "study",
+    "using",
+}
+COMMUNITY_HINTS = [
+    ("Foundations & Graph Theory", {"graph", "theory", "topology", "small-world", "modularity", "community"}),
+    ("Resting-State fMRI & Default Mode", {"resting", "fmri", "default", "bold", "functional"}),
+    ("Structural Connectivity & dMRI", {"structural", "diffusion", "dmri", "tractography", "white", "matter"}),
+    ("Dynamic FC & Brain States", {"dynamic", "state", "states", "temporal", "time", "variability"}),
+    ("Clinical Applications", {"clinical", "disease", "disorder", "alzheimer", "autism", "schizophrenia"}),
+    ("Hubs, Rich-Club & Gradients", {"hub", "hubs", "rich-club", "gradient", "gradients", "hierarchy"}),
+    ("Precision Mapping & Individuality", {"individual", "subject", "personalized", "precision", "fingerprint"}),
+    ("Methods, Tools & Parcellations", {"method", "methods", "atlas", "parcellation", "tool", "pipeline"}),
+    ("Recent Advances", {"deep", "learning", "machine", "prediction", "generative", "transformer"}),
+]
+JEWEL_COLORS = [
+    "#6d8cff",
+    "#64d2ad",
+    "#9ac36a",
+    "#c77dbb",
+    "#d2944a",
+    "#65a6c9",
+    "#d5b94f",
+    "#57bbb4",
+    "#9b7bd3",
+]
 
 
 @dataclass(frozen=True)
@@ -126,6 +172,21 @@ class PaperResult:
 def _safe_text(value: Any, fallback: str = "Unknown") -> str:
     text = str(value).strip() if value is not None else ""
     return text or fallback
+
+
+def get_first_author(authors: str | list[str] | tuple[str, ...] | None) -> str:
+    """Return a stable first-author label from either API strings or lists."""
+    if isinstance(authors, (list, tuple)):
+        for author in authors:
+            clean = _safe_text(author, "")
+            if clean:
+                return clean
+        return "Unknown"
+    text = _safe_text(authors, "")
+    if not text:
+        return "Unknown"
+    first = re.split(r",|;|\bet al\.?", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    return first or "Unknown"
 
 
 def _rough_token_count(text: str) -> int:
@@ -355,6 +416,324 @@ def export_bibtex(results: list[PaperResult]) -> str | None:
         return None
     path = _ensure_export_dir() / "scholar_lens_references.bib"
     path.write_text(_to_bibtex(results), encoding="utf-8")
+    return str(path)
+
+
+def _paper_to_record(paper: PaperResult) -> dict[str, str]:
+    return {
+        "title": paper.title,
+        "year": paper.year,
+        "source": paper.source,
+        "authors": paper.authors,
+        "first_author": get_first_author(paper.authors),
+        "citations": paper.citations,
+        "url": paper.url,
+        "doi": paper.doi,
+        "abstract": paper.abstract,
+    }
+
+
+def _keyword_tokens(*texts: str, limit: int = 10) -> list[str]:
+    counts: Counter[str] = Counter()
+    for text in texts:
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9-]{2,}", (text or "").lower()):
+            token = token.strip("-")
+            if token and token not in GRAPH_STOPWORDS:
+                counts[token] += 1
+    return [token for token, _ in counts.most_common(limit)]
+
+
+def _community_label(keywords: list[str]) -> str:
+    keyword_set = set(keywords)
+    best_label = "Methods, Tools & Parcellations"
+    best_score = 0
+    for label, hints in COMMUNITY_HINTS:
+        score = len(keyword_set & hints)
+        if score > best_score:
+            best_label = label
+            best_score = score
+    return best_label
+
+
+def _assign_graph_communities(nodes: list[dict[str, Any]]) -> None:
+    label_to_id: dict[str, int] = {}
+    for node in nodes:
+        label = _community_label(node.get("keywords", []))
+        if label not in label_to_id:
+            label_to_id[label] = len(label_to_id)
+        community = label_to_id[label]
+        node["community"] = community
+        node["community_label"] = label
+        node["color"] = JEWEL_COLORS[community % len(JEWEL_COLORS)]
+
+
+def _top_weighted_edges(edges: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = sorted(
+        edges.values(),
+        key=lambda edge: (
+            0 if edge["type"] == "direct_citation" else 1 if edge["type"] == "co_citation" else 2,
+            -edge["weight"],
+        ),
+    )
+    return ranked[:CONSTELLATION_MAX_EDGES]
+
+
+def _keyword_edges(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[str]] = {}
+    for node in nodes:
+        for keyword in node.get("keywords", [])[:8]:
+            buckets.setdefault(keyword, []).append(node["id"])
+
+    edges: dict[tuple[str, str], dict[str, Any]] = {}
+    for keyword, ids in buckets.items():
+        if len(ids) < 2 or len(ids) > 45:
+            continue
+        for source, target in itertools.combinations(sorted(ids), 2):
+            key = (source, target)
+            if key not in edges:
+                edges[key] = {
+                    "source": source,
+                    "target": target,
+                    "weight": 0,
+                    "type": "keyword_cooccurrence",
+                    "label": keyword,
+                }
+            edges[key]["weight"] += 1
+    return _top_weighted_edges(edges)
+
+
+def _constellation_payload(
+    *,
+    query: str,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    source: str,
+    direct_edges: int,
+    co_citation_edges: int,
+    fallback_used: bool,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    _assign_graph_communities(nodes)
+    degrees = Counter()
+    for edge in edges:
+        degrees[edge["source"]] += 1
+        degrees[edge["target"]] += 1
+    for node in nodes:
+        node["degree"] = degrees[node["id"]]
+
+    communities = Counter(node["community_label"] for node in nodes)
+    return {
+        "query": query,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": source,
+        "nodes": nodes,
+        "edges": edges,
+        "communities": [
+            {
+                "id": index,
+                "label": label,
+                "count": count,
+                "color": JEWEL_COLORS[index % len(JEWEL_COLORS)],
+            }
+            for index, (label, count) in enumerate(communities.most_common())
+        ],
+        "data_completeness": {
+            "paper_count": len(nodes),
+            "edge_count": len(edges),
+            "direct_citation_edges": direct_edges,
+            "co_citation_edges": co_citation_edges,
+            "keyword_fallback_used": fallback_used,
+            "edge_policy": (
+                "OpenAlex direct citation + co-citation only"
+                if not fallback_used
+                else "Keyword co-occurrence fallback because retrieved citation links were sparse"
+            ),
+            "max_edges": CONSTELLATION_MAX_EDGES,
+            "warnings": warnings or [],
+        },
+    }
+
+
+def build_constellation_from_papers(
+    query: str,
+    papers: list[PaperResult],
+) -> dict[str, Any]:
+    nodes = []
+    for index, paper in enumerate(papers):
+        nodes.append(
+            {
+                "id": f"paper-{index}",
+                "title": paper.title,
+                "year": paper.year,
+                "authors": paper.authors,
+                "first_author": get_first_author(paper.authors),
+                "citations": paper.citations,
+                "url": paper.url,
+                "doi": paper.doi,
+                "abstract": paper.abstract,
+                "keywords": _keyword_tokens(paper.title, paper.abstract, limit=10),
+            }
+        )
+    edges = _keyword_edges(nodes)
+    return _constellation_payload(
+        query=query,
+        nodes=nodes,
+        edges=edges,
+        source="Current search results",
+        direct_edges=0,
+        co_citation_edges=0,
+        fallback_used=True,
+        warnings=["Search-result records do not include reference lists, so keyword fallback is used."],
+    )
+
+
+def fetch_openalex_constellation(
+    query: str,
+    limit: int = CONSTELLATION_OPENALEX_LIMIT,
+) -> tuple[dict[str, Any] | None, str | None]:
+    clean_query = (query or "").strip()
+    if not clean_query:
+        return None, "Enter a topic for the constellation."
+
+    params = {
+        "search": clean_query,
+        "per_page": min(max(limit, 25), 200),
+        "filter": "has_abstract:true",
+        "mailto": CONTACT_EMAIL,
+        "select": (
+            "id,doi,title,publication_year,authorships,cited_by_count,"
+            "referenced_works,abstract_inverted_index,primary_location,concepts"
+        ),
+    }
+    try:
+        payload = _request_json("https://api.openalex.org/works", params)
+    except requests.RequestException:
+        return None, "OpenAlex is unavailable right now, so the constellation could not be built."
+
+    works = payload.get("results", [])
+    nodes: list[dict[str, Any]] = []
+    references_by_id: dict[str, set[str]] = {}
+    for work in works:
+        work_id = _safe_text(work.get("id"), "")
+        if not work_id:
+            continue
+        authors = [
+            authorship.get("author", {}).get("display_name", "")
+            for authorship in work.get("authorships", [])
+        ]
+        abstract = _reconstruct_abstract(work.get("abstract_inverted_index"))
+        concepts = [
+            concept.get("display_name", "")
+            for concept in work.get("concepts", [])
+            if concept.get("display_name")
+        ]
+        location = work.get("primary_location") or {}
+        landing_page = _safe_text(
+            work.get("doi")
+            or location.get("landing_page_url")
+            or location.get("pdf_url")
+            or work_id,
+            "#",
+        )
+        references = {
+            reference
+            for reference in work.get("referenced_works", [])
+            if isinstance(reference, str)
+        }
+        references_by_id[work_id] = references
+        nodes.append(
+            {
+                "id": work_id,
+                "title": _safe_text(work.get("title"), "Untitled paper"),
+                "year": _safe_text(work.get("publication_year")),
+                "authors": _shorten_authors(authors),
+                "first_author": get_first_author(authors),
+                "citations": _safe_text(work.get("cited_by_count"), "0"),
+                "url": landing_page,
+                "doi": _normalize_doi(work.get("doi", "")),
+                "abstract": abstract,
+                "keywords": _keyword_tokens(" ".join(concepts), work.get("title", ""), abstract, limit=12),
+            }
+        )
+
+    id_set = {node["id"] for node in nodes}
+    edge_map: dict[tuple[str, str], dict[str, Any]] = {}
+    direct_edges = 0
+    for source, references in references_by_id.items():
+        for target in references & id_set:
+            if source == target:
+                continue
+            key = tuple(sorted((source, target)))
+            edge_map[key] = {
+                "source": source,
+                "target": target,
+                "weight": 3,
+                "type": "direct_citation",
+                "label": "direct citation",
+            }
+            direct_edges += 1
+
+    co_cited_edges = 0
+    co_citation_pairs: Counter[tuple[str, str]] = Counter()
+    for references in references_by_id.values():
+        internal_refs = sorted(references & id_set)
+        for left, right in itertools.combinations(internal_refs, 2):
+            co_citation_pairs[(left, right)] += 1
+    for (source, target), weight in co_citation_pairs.items():
+        key = tuple(sorted((source, target)))
+        if key in edge_map:
+            continue
+        edge_map[key] = {
+            "source": source,
+            "target": target,
+            "weight": weight,
+            "type": "co_citation",
+            "label": f"co-cited {weight}x",
+        }
+        co_cited_edges += 1
+
+    fallback_used = direct_edges + co_cited_edges < max(8, len(nodes) // 18)
+    if fallback_used:
+        edges = _keyword_edges(nodes)
+    else:
+        edges = _top_weighted_edges(edge_map)
+
+    return (
+        _constellation_payload(
+            query=clean_query,
+            nodes=nodes,
+            edges=edges,
+            source="OpenAlex",
+            direct_edges=direct_edges,
+            co_citation_edges=co_cited_edges,
+            fallback_used=fallback_used,
+            warnings=[] if not fallback_used else ["Citation links among retrieved papers were sparse."],
+        ),
+        None,
+    )
+
+
+def export_corpus_zip(graph: dict[str, Any] | None) -> str | None:
+    if not graph or not graph.get("nodes"):
+        return None
+    path = _ensure_export_dir() / "scholar_lens_constellation_corpus.zip"
+    records = [
+        {
+            key: node.get(key, "")
+            for key in ("id", "title", "year", "authors", "citations", "url", "doi", "abstract", "keywords")
+        }
+        for node in graph.get("nodes", [])
+    ]
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("graph.json", json.dumps(graph, ensure_ascii=False, indent=2))
+        archive.writestr("corpus.json", json.dumps(records, ensure_ascii=False, indent=2))
+        archive.writestr("data-completeness.json", json.dumps(graph.get("data_completeness", {}), indent=2))
+        archive.writestr(
+            "README.txt",
+            "Scholar Lens citation constellation corpus.\n"
+            "Direct/co-citation edges are derived from OpenAlex referenced_works when available.\n"
+            "If keyword_fallback_used is true, edges are keyword co-occurrence and not citation claims.\n",
+        )
     return str(path)
 
 
@@ -840,11 +1219,20 @@ def _selector_choices(results: list[PaperResult]) -> list[str]:
     return [f"{index + 1}. {result.title}" for index, result in enumerate(results)]
 
 
+def _compare_selector_updates(results: list[PaperResult]) -> tuple[gr.Dropdown, gr.Dropdown]:
+    choices = _selector_choices(results)
+    return (
+        gr.update(choices=choices, value=0 if len(results) >= 1 else None),
+        gr.update(choices=choices, value=1 if len(results) >= 2 else None),
+    )
+
+
 def search_all_sources(query: str):
     clean_query = query.strip()
     if not clean_query:
         table, label, page = _page_view([], 0)
         prev_update, next_update = _pagination_updates([], page)
+        compare_left, compare_right = _compare_selector_updates([])
         return (
             "Enter a research topic to search OpenAlex, Crossref, arXiv, and PubMed.",
             table,
@@ -856,10 +1244,13 @@ def search_all_sources(query: str):
             prev_update,
             next_update,
             None,
+            compare_left,
+            compare_right,
         )
     if len(clean_query) > SEARCH_QUERY_CHAR_LIMIT:
         table, label, page = _page_view([], 0)
         prev_update, next_update = _pagination_updates([], page)
+        compare_left, compare_right = _compare_selector_updates([])
         return (
             f"Search topic is too long. Please keep it under {SEARCH_QUERY_CHAR_LIMIT} characters.",
             table,
@@ -871,6 +1262,8 @@ def search_all_sources(query: str):
             prev_update,
             next_update,
             None,
+            compare_left,
+            compare_right,
         )
 
     results, warnings = _collect_results(clean_query)
@@ -891,6 +1284,7 @@ def search_all_sources(query: str):
     table, label, page = _page_view(results, 0)
     prev_update, next_update = _pagination_updates(results, page)
     results_csv = export_results_csv(results) if results else None
+    compare_left, compare_right = _compare_selector_updates(results)
     return (
         status,
         table,
@@ -902,6 +1296,8 @@ def search_all_sources(query: str):
         prev_update,
         next_update,
         results_csv,
+        compare_left,
+        compare_right,
     )
 
 
@@ -1213,9 +1609,323 @@ def summarize_selected_paper_reset_chat(
     return paper_text, load_status, summary, tab_update, "", "", DEFAULT_PAPER_CHAT_ANSWER
 
 
+def _empty_constellation_html(message: str = "Build a constellation to explore papers in 3D.") -> str:
+    safe_message = html.escape(message)
+    return f"""
+    <div class="constellation-empty">
+        <h3>Connectome Constellation</h3>
+        <p>{safe_message}</p>
+    </div>
+    """
+
+
+def _render_constellation_html(graph: dict[str, Any] | None) -> str:
+    if not graph or not graph.get("nodes"):
+        return _empty_constellation_html()
+
+    frame_id = f"constellation-{uuid.uuid4().hex}"
+    graph_json = json.dumps(graph, ensure_ascii=False)
+    srcdoc = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; color: #f8fafc; font-family: Inter, Arial, sans-serif; }}
+#app {{ position: relative; width: 100vw; height: 100vh; overflow: hidden; background: radial-gradient(circle at 50% 35%, rgba(36,52,88,.32), transparent 32%), #000; }}
+#stage {{ position: absolute; inset: 0; }}
+.top {{ position: absolute; top: 26px; left: 36px; right: 36px; text-align: center; pointer-events: none; z-index: 4; }}
+.eyebrow {{ position: absolute; left: 0; top: 6px; color: #d6ad4f; letter-spacing: 4px; font: 700 12px/1 monospace; text-align: left; }}
+h1 {{ margin: 42px 0 8px; font: italic 700 clamp(30px, 4vw, 54px)/1 Georgia, serif; color: rgba(255,255,255,.92); text-shadow: 0 0 24px rgba(255,255,255,.2); }}
+.meta {{ color: rgba(255,255,255,.48); font: 700 13px/1.5 monospace; letter-spacing: 1px; }}
+.stats {{ position: absolute; left: 32px; bottom: 32px; display: grid; grid-template-columns: repeat(3, minmax(96px, 1fr)); gap: 14px; padding: 18px 20px; background: rgba(5,7,14,.74); border: 1px solid rgba(255,255,255,.1); border-radius: 8px; backdrop-filter: blur(14px); z-index: 5; }}
+.stat strong {{ display: block; color: #d6ad4f; font: 800 22px/1.1 monospace; }}
+.stat span {{ color: rgba(255,255,255,.45); font: 700 10px/1.4 monospace; letter-spacing: 1px; text-transform: uppercase; }}
+.legend {{ position: absolute; right: 28px; bottom: 32px; width: min(390px, 33vw); max-height: 42vh; overflow: auto; padding: 18px 20px; background: rgba(5,7,14,.76); border: 1px solid rgba(255,255,255,.1); border-radius: 8px; backdrop-filter: blur(14px); z-index: 6; }}
+.legend-title {{ color: rgba(255,255,255,.42); font: 800 10px/1.5 monospace; letter-spacing: 3px; margin-bottom: 12px; }}
+.legend-row {{ display: grid; grid-template-columns: 14px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; cursor: pointer; color: rgba(255,255,255,.72); font: 700 12px/1.25 monospace; }}
+.dot {{ width: 11px; height: 11px; border-radius: 50%; box-shadow: 0 0 15px currentColor; }}
+.legend-row:hover, .legend-row.active {{ color: #fff; }}
+.detail {{ position: absolute; top: 170px; right: 28px; width: min(430px, 34vw); max-height: 56vh; overflow: auto; padding: 18px 20px; background: rgba(5,7,14,.88); border: 1px solid rgba(214,173,79,.3); border-radius: 8px; box-shadow: 0 0 32px rgba(214,173,79,.08); z-index: 7; display: none; }}
+.detail h2 {{ margin: 0 0 8px; font: 700 18px/1.2 Georgia, serif; }}
+.detail .byline {{ color: rgba(255,255,255,.55); font: 700 11px/1.5 monospace; margin-bottom: 12px; }}
+.detail p {{ color: rgba(255,255,255,.76); font: 13px/1.55 Arial, sans-serif; }}
+.detail a {{ display: inline-flex; margin-top: 10px; color: #f1c863; text-decoration: none; font-weight: 800; }}
+.completeness {{ position: absolute; left: 50%; transform: translateX(-50%); bottom: 18px; color: rgba(255,255,255,.42); font: 700 10px/1.4 monospace; letter-spacing: 1px; z-index: 5; pointer-events: none; }}
+@media (max-width: 820px) {{ .eyebrow {{ position: static; text-align: center; }} .top {{ left: 16px; right: 16px; }} .stats {{ grid-template-columns: repeat(2, 1fr); left: 14px; bottom: 14px; max-width: 48vw; }} .legend {{ right: 14px; bottom: 14px; width: 42vw; }} .detail {{ left: 14px; right: 14px; width: auto; top: 142px; }} }}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage"></div>
+  <div class="top">
+    <div class="eyebrow">LIVING LITERATURE MAP</div>
+    <h1>Connectome Constellation</h1>
+    <div class="meta" id="meta"></div>
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="legend" id="legend"><div class="legend-title">LEGEND - DRAG TO ROTATE - SCROLL TO ZOOM</div></div>
+  <div class="detail" id="detail"></div>
+  <div class="completeness" id="completeness"></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script>
+const graph = {graph_json};
+const container = document.getElementById('stage');
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x000000, 0.00075);
+const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 1, 6000);
+camera.position.set(0, 0, 2200);
+const renderer = new THREE.WebGLRenderer({{ antialias: true, alpha: false }});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+container.appendChild(renderer.domElement);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.045;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.36;
+controls.minDistance = 260;
+controls.maxDistance = 2600;
+renderer.domElement.addEventListener('wheel', (event) => event.preventDefault(), {{ passive: false }});
+const composer = new THREE.EffectComposer(renderer);
+composer.addPass(new THREE.RenderPass(scene, camera));
+const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.35, 0.56, 0.2);
+composer.addPass(bloom);
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const nodeSprites = [];
+const nodeById = new Map();
+const neighbors = new Map();
+let activeCommunity = null;
+let selectedId = null;
+
+function glowTexture(color) {{
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  const grad = ctx.createRadialGradient(64,64,0,64,64,64);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(.14, color);
+  grad.addColorStop(.45, color.replace(')', ', .38)').replace('rgb', 'rgba'));
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,128,128);
+  return new THREE.CanvasTexture(canvas);
+}}
+function hexToRgb(hex) {{
+  const num = parseInt(hex.slice(1), 16);
+  return `rgb(${{(num >> 16) & 255}},${{(num >> 8) & 255}},${{num & 255}})`;
+}}
+function positionFor(i, n, degree) {{
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const y = 1 - (i / Math.max(1, n - 1)) * 2;
+  const radius = Math.sqrt(Math.max(0, 1 - y * y));
+  const theta = i * golden;
+  const jitter = 1 + (((i * 37) % 19) - 9) * 0.006;
+  const shell = 360 + Math.min(220, degree * 14);
+  return new THREE.Vector3(
+    Math.cos(theta) * radius * shell * 1.75 * jitter,
+    y * shell * 0.92,
+    Math.sin(theta) * radius * shell * 0.78 * jitter
+  );
+}}
+graph.nodes.forEach((node, index) => {{
+  nodeById.set(node.id, node);
+  neighbors.set(node.id, new Set());
+  node.position = positionFor(index, graph.nodes.length, node.degree || 0);
+}});
+graph.edges.forEach(edge => {{
+  if (neighbors.has(edge.source)) neighbors.get(edge.source).add(edge.target);
+  if (neighbors.has(edge.target)) neighbors.get(edge.target).add(edge.source);
+}});
+const edgePositions = [];
+graph.edges.forEach(edge => {{
+  const a = nodeById.get(edge.source), b = nodeById.get(edge.target);
+  if (!a || !b) return;
+  edgePositions.push(a.position.x, a.position.y, a.position.z, b.position.x, b.position.y, b.position.z);
+}});
+const edgeGeometry = new THREE.BufferGeometry();
+edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
+const edgeMaterial = new THREE.LineBasicMaterial({{ color: 0xd6ad4f, transparent: true, opacity: 0.12, depthWrite: false, blending: THREE.AdditiveBlending }});
+scene.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+graph.nodes.forEach(node => {{
+  const material = new THREE.SpriteMaterial({{ map: glowTexture(hexToRgb(node.color)), transparent: true, opacity: .88, depthWrite: false, blending: THREE.AdditiveBlending }});
+  const sprite = new THREE.Sprite(material);
+  sprite.position.copy(node.position);
+  const size = 18 + Math.min(48, Math.sqrt((node.degree || 0) + 1) * 7);
+  sprite.scale.set(size, size, 1);
+  sprite.userData.node = node;
+  nodeSprites.push(sprite);
+  scene.add(sprite);
+}});
+const stars = new THREE.BufferGeometry();
+const starPositions = [];
+for (let i = 0; i < 1400; i++) {{
+  starPositions.push((Math.random() - .5) * 3600, (Math.random() - .5) * 2100, (Math.random() - .5) * 2600);
+}}
+stars.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+scene.add(new THREE.Points(stars, new THREE.PointsMaterial({{ color: 0x9fb7ff, size: 1.15, transparent: true, opacity: .38 }})));
+function refreshNodes() {{
+  const selectedNeighbors = selectedId ? neighbors.get(selectedId) || new Set() : new Set();
+  nodeSprites.forEach(sprite => {{
+    const node = sprite.userData.node;
+    const communityOk = activeCommunity === null || node.community === activeCommunity;
+    const selectedOk = !selectedId || node.id === selectedId || selectedNeighbors.has(node.id);
+    const visible = communityOk && selectedOk;
+    sprite.material.opacity = visible ? .96 : .14;
+    const boost = node.id === selectedId ? 1.9 : selectedNeighbors.has(node.id) ? 1.35 : 1;
+    const base = 18 + Math.min(48, Math.sqrt((node.degree || 0) + 1) * 7);
+    sprite.scale.set(base * boost, base * boost, 1);
+  }});
+}}
+function showDetail(node) {{
+  selectedId = node.id;
+  controls.autoRotate = false;
+  const detail = document.getElementById('detail');
+  detail.style.display = 'block';
+  detail.innerHTML = `<h2>${{escapeHtml(node.title)}}</h2><div class="byline">${{escapeHtml(node.first_author || node.authors)}} - ${{escapeHtml(node.year)}} - ${{escapeHtml(String(node.citations))}} cites</div><p>${{escapeHtml(node.abstract || 'No abstract was available for this paper.')}}</p><a href="${{escapeAttr(node.url || '#')}}" target="_blank" rel="noopener noreferrer">Open paper</a>`;
+  refreshNodes();
+}}
+function escapeHtml(value) {{ return String(value || '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}}[ch])); }}
+function escapeAttr(value) {{ return escapeHtml(value).replace(/`/g, '&#096;'); }}
+function pick(event) {{
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(nodeSprites);
+  if (hits.length) showDetail(hits[0].object.userData.node);
+}}
+renderer.domElement.addEventListener('click', pick);
+document.getElementById('meta').textContent = `${{graph.nodes.length}} papers - ${{graph.communities.length}} communities - ${{graph.edges.length}} edges - ${{graph.query}}`;
+document.getElementById('stats').innerHTML = [
+  ['PAPERS', graph.nodes.length],
+  ['EDGES', graph.edges.length],
+  ['DIRECT', graph.data_completeness.direct_citation_edges],
+  ['CO-CITED', graph.data_completeness.co_citation_edges],
+  ['FALLBACK', graph.data_completeness.keyword_fallback_used ? 'YES' : 'NO'],
+  ['MAX EDGES', graph.data_completeness.max_edges]
+].map(([label, value]) => `<div class="stat"><strong>${{value}}</strong><span>${{label}}</span></div>`).join('');
+document.getElementById('completeness').textContent = graph.data_completeness.edge_policy;
+const legend = document.getElementById('legend');
+graph.communities.forEach(comm => {{
+  const row = document.createElement('div');
+  row.className = 'legend-row';
+  row.innerHTML = `<span class="dot" style="color:${{comm.color}}; background:${{comm.color}}"></span><span>${{escapeHtml(comm.label)}}</span><span>${{comm.count}}</span>`;
+  row.addEventListener('mouseenter', () => {{ activeCommunity = comm.id; refreshNodes(); row.classList.add('active'); }});
+  row.addEventListener('mouseleave', () => {{ activeCommunity = null; refreshNodes(); row.classList.remove('active'); }});
+  row.addEventListener('click', () => {{ activeCommunity = activeCommunity === comm.id ? null : comm.id; refreshNodes(); }});
+  legend.appendChild(row);
+}});
+function resize() {{
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+}}
+addEventListener('resize', resize);
+let start = performance.now();
+function animate(now) {{
+  requestAnimationFrame(animate);
+  const t = Math.min(1, (now - start) / 2200);
+  camera.position.z = 2200 - 1200 * (1 - Math.pow(1 - t, 3));
+  controls.update();
+  composer.render();
+}}
+animate(start);
+</script>
+</body>
+</html>
+"""
+    return (
+        f'<iframe id="{frame_id}" class="constellation-frame" '
+        f'sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox" '
+        f'srcdoc="{html.escape(srcdoc, quote=True)}"></iframe>'
+    )
+
+
+def build_openalex_constellation(query: str) -> tuple[str, str, dict[str, Any] | None, str | None]:
+    graph, error = fetch_openalex_constellation(query)
+    if error:
+        return error, _empty_constellation_html(error), None, None
+    assert graph is not None
+    zip_path = export_corpus_zip(graph)
+    completeness = graph["data_completeness"]
+    status = (
+        f"Built {completeness['paper_count']} papers and {completeness['edge_count']} edges. "
+        f"Data completeness: {completeness['edge_policy']}."
+    )
+    return status, _render_constellation_html(graph), graph, zip_path
+
+
+def build_search_result_constellation(
+    query: str,
+    results: list[PaperResult],
+) -> tuple[str, str, dict[str, Any] | None, str | None]:
+    if not results:
+        message = "Search first, then build a constellation from the current results."
+        return message, _empty_constellation_html(message), None, None
+    graph = build_constellation_from_papers(query or "current search results", results)
+    zip_path = export_corpus_zip(graph)
+    return (
+        f"Built a keyword fallback constellation from {len(results)} current search results.",
+        _render_constellation_html(graph),
+        graph,
+        zip_path,
+    )
+
+
+def compare_papers_with_ai(
+    left_index: Any,
+    right_index: Any,
+    results: list[PaperResult],
+) -> str:
+    try:
+        left = int(left_index)
+        right = int(right_index)
+    except (TypeError, ValueError):
+        return "Choose two papers from the current search results."
+    if left == right:
+        return "Choose two different papers to compare."
+    if left < 0 or right < 0 or left >= len(results) or right >= len(results):
+        return "One of the selected papers is no longer available in the search results."
+
+    papers = [results[left], results[right]]
+    contexts = []
+    for index, paper in enumerate(papers, start=1):
+        abstract = _trim_to_budget(paper.abstract, MAX_ABSTRACT_CHARS, MAX_ABSTRACT_TOKENS)
+        contexts.append(
+            f"[{index}] Title: {paper.title}\n"
+            f"Authors: {paper.authors}\n"
+            f"Year: {paper.year}\n"
+            f"Source: {paper.source}\n"
+            f"Citations: {paper.citations}\n"
+            f"URL: {paper.url}\n"
+            f"Abstract: {abstract or 'No abstract available.'}"
+        )
+    prompt = (
+        "Compare these two papers for a researcher. Use only the provided metadata "
+        "and abstracts. Cover: shared problem, method/data differences, claims, "
+        "limitations, which one to read first for which purpose, and open questions. "
+        "If evidence is missing, say so."
+    )
+    return synthesize_with_modal(prompt, "\n\n".join(contexts))
+
+
 def clear_search():
     table, label, page = _page_view([], 0)
     prev_update, next_update = _pagination_updates([], page)
+    compare_left, compare_right = _compare_selector_updates([])
+    graph_message = _empty_constellation_html()
     return (
         "Enter a research topic to begin.",
         table,
@@ -1239,6 +1949,12 @@ def clear_search():
         "",
         "",
         DEFAULT_PAPER_CHAT_ANSWER,
+        compare_left,
+        compare_right,
+        "",
+        DEFAULT_COMPARE_ANSWER,
+        graph_message,
+        None,
     )
 
 
@@ -1333,6 +2049,27 @@ CUSTOM_CSS = """
     color: var(--sl-accent-bright) !important;
     border-bottom: 2px solid var(--sl-accent) !important;
     background: var(--sl-accent-soft) !important;
+}
+.gradio-container .overflow-menu button {
+    color: var(--sl-text-bright) !important;
+}
+.gradio-container .overflow-dropdown {
+    background: var(--sl-panel) !important;
+    border: 1px solid var(--sl-border) !important;
+    box-shadow: 0 18px 45px rgba(2, 6, 23, 0.55) !important;
+}
+.gradio-container .overflow-dropdown button {
+    background: transparent !important;
+    color: var(--sl-text-bright) !important;
+}
+.gradio-container .overflow-dropdown button:hover,
+.gradio-container .overflow-dropdown button:focus {
+    background: var(--sl-accent-soft) !important;
+    color: var(--sl-accent-bright) !important;
+}
+.gradio-container .overflow-dropdown button.selected {
+    background: rgba(59, 130, 246, 0.24) !important;
+    color: var(--sl-text-bright) !important;
 }
 
 /* ===== INPUTS ===== */
@@ -1562,6 +2299,37 @@ CUSTOM_CSS = """
 .ref-meta { color: var(--sl-muted); font-size: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ref-snippet { color: var(--sl-text); font-size: 13px; line-height: 1.45; }
 
+.constellation-frame {
+    width: 100%;
+    height: min(860px, 78vh);
+    min-height: 620px;
+    border: 1px solid rgba(214, 173, 79, 0.25);
+    border-radius: 8px;
+    background: #000;
+    overflow: hidden;
+}
+.constellation-empty {
+    min-height: 420px;
+    border: 1px solid rgba(214, 173, 79, 0.22);
+    border-radius: 8px;
+    background:
+        radial-gradient(circle at 50% 35%, rgba(214, 173, 79, 0.08), transparent 34%),
+        #020617;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: var(--sl-muted);
+}
+.constellation-empty h3 {
+    margin: 0 0 8px;
+    color: var(--sl-text-bright);
+    font-family: "Playfair Display", "Georgia", serif;
+    font-size: 30px;
+}
+.constellation-empty p { max-width: 520px; margin: 0; }
+
 /* Remove system buttons and footers */
 .settings, footer, .show-api { display: none !important; }
 
@@ -1640,6 +2408,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
 
             papers_state = gr.State([])
             page_state = gr.State(0)
+            graph_state = gr.State(None)
 
             with gr.Tabs(selected="ask") as app_tabs:
                 with gr.Tab("💬  Ask", id="ask"):
@@ -1686,6 +2455,38 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         fn=ask_scholar_lens,
                         inputs=question_input,
                         outputs=[answer_output, references_output],
+                        show_progress="full",
+                    )
+
+                with gr.Tab("Compare", id="compare"):
+                    gr.Markdown(
+                        "Search for papers, choose any two results, and ask the AI to compare their methods, claims, limitations, and best use cases.",
+                        elem_classes=["ask-intro"],
+                    )
+                    with gr.Row(elem_classes=["action-row"]):
+                        compare_left_selector = gr.Dropdown(
+                            label="Paper A",
+                            choices=[],
+                            type="index",
+                            interactive=True,
+                            scale=1,
+                        )
+                        compare_right_selector = gr.Dropdown(
+                            label="Paper B",
+                            choices=[],
+                            type="index",
+                            interactive=True,
+                            scale=1,
+                        )
+                        compare_button = gr.Button("Compare with AI", variant="primary", scale=0, min_width=170)
+                    compare_output = gr.Markdown(
+                        DEFAULT_COMPARE_ANSWER,
+                        elem_classes=["answer-card"],
+                    )
+                    compare_button.click(
+                        fn=compare_papers_with_ai,
+                        inputs=[compare_left_selector, compare_right_selector, papers_state],
+                        outputs=compare_output,
                         show_progress="full",
                     )
 
@@ -1746,6 +2547,8 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         prev_button,
                         next_button,
                         results_download,
+                        compare_left_selector,
+                        compare_right_selector,
                     ]
                     search_button.click(
                         fn=search_all_sources,
@@ -1780,6 +2583,50 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                         label="Selected row index",
                         elem_id="hidden_index_input",
                         elem_classes=["hidden-component"],
+                    )
+
+                with gr.Tab("Constellation", id="constellation"):
+                    with gr.Row():
+                        graph_query = gr.Textbox(
+                            label="Constellation topic",
+                            value="network neuroscience brain connectome",
+                            placeholder="e.g. network neuroscience brain connectome",
+                            scale=5,
+                            container=False,
+                            max_length=SEARCH_QUERY_CHAR_LIMIT,
+                        )
+                        build_graph_button = gr.Button("Build 3D Map", variant="primary", scale=1)
+                    with gr.Row():
+                        build_from_search_button = gr.Button("Use Current Search Results", size="sm")
+                        corpus_download = gr.DownloadButton(
+                            "Download Corpus ZIP",
+                            value=None,
+                            size="sm",
+                            elem_classes=["download-action"],
+                        )
+                    graph_status = gr.Markdown(
+                        "Build a constellation from OpenAlex or from current search results.",
+                        elem_classes=["status-line"],
+                    )
+                    graph_output = gr.HTML(_empty_constellation_html())
+
+                    build_graph_button.click(
+                        fn=build_openalex_constellation,
+                        inputs=graph_query,
+                        outputs=[graph_status, graph_output, graph_state, corpus_download],
+                        show_progress="full",
+                    )
+                    graph_query.submit(
+                        fn=build_openalex_constellation,
+                        inputs=graph_query,
+                        outputs=[graph_status, graph_output, graph_state, corpus_download],
+                        show_progress="full",
+                    )
+                    build_from_search_button.click(
+                        fn=build_search_result_constellation,
+                        inputs=[query_input, papers_state],
+                        outputs=[graph_status, graph_output, graph_state, corpus_download],
+                        show_progress="full",
                     )
 
                 with gr.Tab("✨  Summarize", id="summarize"):
@@ -1944,6 +2791,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     summary_download,
                     chat_question,
                     chat_output,
+                    compare_left_selector,
+                    compare_right_selector,
+                    graph_status,
+                    compare_output,
+                    graph_output,
+                    corpus_download,
                 ],
             )
 
@@ -1961,3 +2814,5 @@ if __name__ == "__main__":
         css=CUSTOM_CSS,
         head=HEAD_SCRIPT,
     )
+
+
