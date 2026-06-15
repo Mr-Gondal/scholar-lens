@@ -8,7 +8,7 @@ from typing import Annotated
 import modal
 from fastapi import Header, HTTPException
 
-app = modal.App("scholar-lens-summarizer")
+app = modal.App("scholar-lens-summarizer-v2")
 
 MODEL_NAME = os.getenv("SCHOLAR_LENS_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 GPU_TYPE = os.getenv("SCHOLAR_LENS_GPU", "L4")
@@ -40,6 +40,7 @@ image = (
     .env({"CUDA_HOME": "/usr/local/cuda"})
     .pip_install(
         "vllm==0.8.5.post1",
+        "transformers==4.51.3",
         "fastapi[standard]",
     )
 )
