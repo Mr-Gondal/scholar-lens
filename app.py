@@ -1266,13 +1266,7 @@ def _render_results_table(results: list[PaperResult], start_index: int = 0) -> s
             textwrap.dedent(
                 f"""
                 <tr
-                    id="row-{result_index}"
                     class="result-row"
-                    role="button"
-                    tabindex="0"
-                    aria-label="Select paper {number}: {html.escape(result.title, quote=True)}"
-                    onclick="selectPaper(event, {result_index})"
-                    onkeydown="selectPaperFromKey(event, {result_index})"
                 >
                     <td class="num-cell">{number}</td>
                     <td class="title-cell">{html.escape(result.title)}</td>
@@ -1280,7 +1274,7 @@ def _render_results_table(results: list[PaperResult], start_index: int = 0) -> s
                     <td>{_source_badge(result.source)}</td>
                     <td class="authors-cell">{html.escape(result.authors)}</td>
                     <td class="citation-cell">{html.escape(result.citations)}</td>
-                    <td class="action-cell"><span class="row-action">Summarize</span><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Open ↗</a></td>
+                    <td class="action-cell"><a class="paper-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">Open ↗</a></td>
                 </tr>
                 """
             ).strip()
@@ -1409,8 +1403,8 @@ def _selector_choices(results: list[PaperResult]) -> list[str]:
 def _compare_selector_updates(results: list[PaperResult]) -> tuple[gr.Dropdown, gr.Dropdown]:
     choices = _selector_choices(results)
     return (
-        gr.update(choices=choices, value=0 if len(results) >= 1 else None),
-        gr.update(choices=choices, value=1 if len(results) >= 2 else None),
+        gr.update(choices=choices, value=choices[0] if len(results) >= 1 else None),
+        gr.update(choices=choices, value=choices[1] if len(results) >= 2 else None),
     )
 
 
@@ -1790,7 +1784,7 @@ def summarize_row_selection(
     selected_index: Any,
     results: list[PaperResult],
 ) -> tuple[str, str, str, gr.Tabs, gr.Dropdown, str, str, str]:
-    paper_text, load_status, summary, tab_update = summarize_selected_paper(
+    paper_text, load_status, summary, tab_update, results_text, chat_question, chat_output = load_selected_paper_reset_chat(
         selected_index,
         results,
     )
@@ -1804,9 +1798,9 @@ def summarize_row_selection(
         summary,
         tab_update,
         gr.update(value=dropdown_value),
-        "",
-        "",
-        DEFAULT_PAPER_CHAT_ANSWER,
+        results_text,
+        chat_question,
+        chat_output,
     )
 
 
@@ -1821,7 +1815,7 @@ def summarize_selected_paper_reset_chat(
     return paper_text, load_status, summary, tab_update, "", "", DEFAULT_PAPER_CHAT_ANSWER
 
 
-def _empty_constellation_html(message: str = "Build a constellation to explore papers in 3D.") -> str:
+def _empty_constellation_html(message: str = "Build a constellation to explore connected papers.") -> str:
     safe_message = html.escape(message)
     return f"""
     <div class="constellation-empty">
@@ -2036,26 +2030,6 @@ function draw() {{
     ctx.stroke();
   }});
   ctx.globalAlpha = 1;
-  const labeled = graph.nodes
-    .filter(node => visibleNode(node))
-    .sort((a, b) => (b.degree || 0) - (a.degree || 0))
-    .slice(0, selectedId || hoverId ? 18 : 10);
-  if (selectedId) labeled.push(nodeById.get(selectedId));
-  if (hoverId) labeled.push(nodeById.get(hoverId));
-  const seen = new Set();
-  labeled.forEach(node => {{
-    if (!node || seen.has(node.id)) return;
-    seen.add(node.id);
-    const p = toScreen(node);
-    const title = String(node.title || 'Untitled paper');
-    const label = title.length > 54 ? title.slice(0, 51) + '...' : title;
-    ctx.font = '700 11px Inter, Arial, sans-serif';
-    ctx.fillStyle = 'rgba(255,255,255,.86)';
-    ctx.shadowColor = '#02030a';
-    ctx.shadowBlur = 6;
-    ctx.fillText(label, p.x + node.radius + 9, p.y + 4);
-    ctx.shadowBlur = 0;
-  }});
 }}
 function nearestNode(event) {{
   const rect = canvas.getBoundingClientRect();
@@ -2341,13 +2315,32 @@ CUSTOM_CSS = """
 }
 
 /* ===== TABS ===== */
-.tab-nav { border-bottom: 1px solid var(--sl-border) !important; }
+.gradio-container .tabs,
+.gradio-container .tabitem,
+.gradio-container [role="tabpanel"],
+.gradio-container .panel,
+.gradio-container .block,
+.gradio-container .form,
+.gradio-container .contain,
+.gradio-container .wrap:not(:has(input.border-none)),
+.gradio-container .wrap-inner:not(:has(input.border-none)) {
+    background: var(--sl-bg) !important;
+    color: var(--sl-text) !important;
+    border-color: var(--sl-border) !important;
+}
+.tab-nav {
+    border-bottom: 1px solid var(--sl-border) !important;
+    background: var(--sl-panel) !important;
+    border-radius: 8px 8px 0 0 !important;
+    padding: 4px !important;
+}
 .gradio-container [role="tab"],
 .gradio-container .tab-nav button {
     background: transparent !important;
-    color: var(--sl-text-bright) !important;
+    color: var(--sl-muted) !important;
     border-color: transparent !important;
     box-shadow: none !important;
+    min-height: 36px !important;
 }
 /* include :active and :focus-visible so a clicked tab never flashes white */
 .gradio-container [role="tab"]:hover,
@@ -2370,6 +2363,14 @@ CUSTOM_CSS = """
     border-bottom: 2px solid var(--sl-accent) !important;
     background: var(--sl-accent-soft) !important;
     box-shadow: inset 0 -2px 0 var(--sl-accent) !important;
+}
+
+.gradio-container button[disabled],
+.gradio-container button:disabled {
+    background: rgba(30, 41, 59, 0.7) !important;
+    color: rgba(148, 163, 184, 0.7) !important;
+    border-color: rgba(51, 65, 85, 0.8) !important;
+    opacity: 1 !important;
 }
 .gradio-container .overflow-menu button {
     color: var(--sl-text-bright) !important;
@@ -2456,6 +2457,17 @@ CUSTOM_CSS = """
     background: var(--sl-accent-bright) !important;
     box-shadow: 0 6px 20px rgba(59, 130, 246, 0.45) !important;
 }
+.gradio-container button:not(.primary):not([role="tab"]) {
+    background: var(--sl-panel) !important;
+    color: var(--sl-text-bright) !important;
+    border: 1px solid var(--sl-border) !important;
+}
+.gradio-container button:not(.primary):not([role="tab"]):hover,
+.gradio-container button:not(.primary):not([role="tab"]):focus {
+    background: var(--sl-panel-soft) !important;
+    border-color: rgba(96, 165, 250, 0.55) !important;
+    color: var(--sl-text-bright) !important;
+}
 
 /* ===== RESULTS TABLE ===== */
 .table-shell {
@@ -2488,7 +2500,7 @@ CUSTOM_CSS = """
     width: 18px;
     height: 18px;
 }
-.result-row { cursor: pointer; transition: background 140ms ease; }
+.result-row { transition: background 140ms ease; }
 .result-row:hover { background: var(--sl-panel-soft); }
 .result-row.selected {
     background: var(--sl-accent-soft) !important;
@@ -2515,6 +2527,32 @@ CUSTOM_CSS = """
 .status-line {
     color: var(--sl-muted) !important;
     padding: 4px 2px;
+}
+.empty-state {
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    color: var(--sl-muted) !important;
+    border: 1px dashed rgba(96, 165, 250, 0.25);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.58);
+    text-align: center;
+    padding: 24px;
+}
+.empty-state h3 {
+    color: var(--sl-text-bright) !important;
+    margin: 0;
+}
+.empty-state p {
+    color: var(--sl-muted) !important;
+    margin: 0;
+}
+.empty-crest {
+    font-size: 28px;
+    color: var(--sl-accent-bright);
 }
 .insight-grid {
     display: grid;
@@ -2555,14 +2593,17 @@ CUSTOM_CSS = """
     align-items: center;
     flex-wrap: wrap;
 }
-.row-action {
-    color: var(--sl-accent-bright);
-    font-size: 12px;
-    font-weight: 700;
-}
 .btn-crimson button {
+    background: rgba(127, 29, 29, 0.86) !important;
     border-color: rgba(239, 68, 68, 0.4) !important;
     color: #fecaca !important;
+    box-shadow: 0 4px 14px rgba(127, 29, 29, 0.25) !important;
+}
+.btn-crimson button:hover,
+.btn-crimson button:focus {
+    background: rgba(185, 28, 28, 0.92) !important;
+    border-color: rgba(248, 113, 113, 0.7) !important;
+    color: #fff !important;
 }
 .sample-row {
     gap: 8px;
@@ -2715,6 +2756,7 @@ function selectPaper(event, index) {
         ).set;
         setter.call(input, String(index));
         input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
     }
     document.querySelectorAll('.result-row').forEach(r => r.classList.remove('selected'));
     const row = document.getElementById('row-' + index);
@@ -2960,13 +3002,13 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     with gr.Row():
                         graph_query = gr.Textbox(
                             label="Constellation topic",
-                            value="network neuroscience brain connectome",
-                            placeholder="e.g. network neuroscience brain connectome",
+                            value="",
+                            placeholder="e.g. atmospheric rivers, satellite precipitation, aerosol-cloud interactions",
                             scale=5,
                             container=False,
                             max_length=SEARCH_QUERY_CHAR_LIMIT,
                         )
-                        build_graph_button = gr.Button("Build 3D Map", variant="primary", scale=1)
+                        build_graph_button = gr.Button("Build Map", variant="primary", scale=1)
                     with gr.Row():
                         build_from_search_button = gr.Button("Use Current Search Results", size="sm")
                         corpus_download = gr.DownloadButton(

@@ -126,6 +126,14 @@ class AppCoreTests(unittest.TestCase):
         self.assertTrue(second_prev["interactive"])
         self.assertFalse(second_next["interactive"])
 
+    def test_compare_selector_updates_use_display_choices(self):
+        papers = [paper("Paper A"), paper("Paper B")]
+
+        left, right = app._compare_selector_updates(papers)
+
+        self.assertEqual(left["value"], "1. Paper A")
+        self.assertEqual(right["value"], "2. Paper B")
+
     def test_reconstruct_abstract_orders_openalex_index(self):
         abstract = app._reconstruct_abstract({"world": [1], "hello": [0]})
 
@@ -210,6 +218,20 @@ class AppCoreTests(unittest.TestCase):
         self.assertIn("Click Summarize with AI", summary)
         self.assertEqual(tab_update["selected"], "summarize")
 
+    def test_row_selection_loads_without_modal_call(self):
+        item = paper("Useful Paper", abstract="A clear abstract about useful results.")
+        with patch("app.summarize_with_modal") as mocked:
+            paper_text, status, summary, tab_update, *_ = app.summarize_row_selection(
+                "0",
+                [item],
+            )
+
+        mocked.assert_not_called()
+        self.assertIn("Useful Paper", paper_text)
+        self.assertIn("Loaded", status)
+        self.assertIn("Click Summarize with AI", summary)
+        self.assertEqual(tab_update["selected"], "summarize")
+
     def test_export_results_csv_creates_file(self):
         path = app.export_results_csv([paper("Exportable Paper")])
 
@@ -284,6 +306,10 @@ class AppCoreTests(unittest.TestCase):
         self.assertIn("Literature Constellation", html)
         self.assertIn("CONNECTED LITERATURE MAP", html)
         self.assertIn("canvas", html)
+        self.assertIn("function showDetail", html)
+        self.assertIn("if (node) showDetail(node)", html)
+        self.assertNotIn("const labeled", html)
+        self.assertNotIn("fillText(label", html)
         self.assertNotIn("Connectome Constellation", html)
 
     def test_compare_prompt_names_nemotron(self):
