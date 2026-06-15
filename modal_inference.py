@@ -10,13 +10,19 @@ from fastapi import Header, HTTPException
 
 app = modal.App("scholar-lens-summarizer-v2")
 
-MODEL_NAME = os.getenv("SCHOLAR_LENS_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+MODEL_NAME = os.getenv(
+    "SCHOLAR_LENS_MODEL",
+    # Llama-architecture Nemotron: NVIDIA-eligible, loads on stock vLLM (no
+    # Mamba/hybrid deps), 128k context, and its system prompt reasoning toggle
+    # ("detailed thinking off") is supported. Lowest-risk Nemotron for deploy.
+    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+)
 GPU_TYPE = os.getenv("SCHOLAR_LENS_GPU", "L4")
 # Seconds to keep a warm container after the last request. Bump this (e.g.
 # 600) right before recording a demo so the model never cold-starts on camera.
 SCALEDOWN_WINDOW = int(os.getenv("SCHOLAR_LENS_SCALEDOWN", "90"))
-# Keep the context small enough for the 3B model to start quickly and stay
-# honest: Scholar Lens supplies the abstracts, then the model synthesizes them.
+# Keep the context small enough for single-GPU Modal deploys to start quickly
+# and stay honest: Scholar Lens supplies the abstracts, then Nemotron synthesizes them.
 MAX_MODEL_LEN = 8192
 MAX_PROMPT_TOKENS = 7000
 SUMMARY_INPUT_CHAR_LIMIT = 60000
@@ -48,8 +54,8 @@ image = (
 
 @app.cls(
     image=image,
-    # Qwen2.5 3B keeps the small-model story load-bearing and deploys on a
-    # modest GPU; override SCHOLAR_LENS_GPU for benchmark runs.
+    # Llama-Nemotron-Nano-8B keeps the NVIDIA prize story load-bearing while
+    # fitting a modest single GPU; override SCHOLAR_LENS_GPU for benchmark runs.
     gpu=GPU_TYPE,
     timeout=300,
     # Keep warm briefly for live demos without leaving an expensive GPU idle.
@@ -69,6 +75,10 @@ class Summarizer:
             model=MODEL_NAME,
             max_model_len=MAX_MODEL_LEN,
             gpu_memory_utilization=0.90,
+            trust_remote_code=True,
+            # Avoid a long torch.compile/cudagraph cold-start on small demo
+            # requests; the app values dependable startup over peak throughput.
+            enforce_eager=True,
         )
 
     def _generate(self, prompt: str, max_new_tokens: int = 300) -> str:
@@ -80,10 +90,21 @@ class Summarizer:
                 f"Prompt is too long for this endpoint ({prompt_tokens:,} rough tokens)."
             )
 
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "detailed thinking off. You are a grounded research assistant. "
+                    "Use only the supplied context; do not infer missing methods, "
+                    "baselines, metrics, datasets, citations, or results. Never use "
+                    "speculative phrases such as likely, probably, presumably, or assuming."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
-            temperature=0.15,
+            temperature=0.0,
         )
         outputs = self.model.chat(
             messages,
@@ -143,19 +164,29 @@ class Summarizer:
         chunks = self._chunk_summary_text(text)
         if len(chunks) <= 1:
             prompt = (
-                "Summarize the following research paper context in 4-6 clear "
-                "sentences. Cover the main contribution, methods, and key "
-                "results/findings. If a Results / Findings section is present, "
-                "use it as stronger evidence than the abstract.\n\n"
+                "Summarize the following research paper context in one plain "
+                "paragraph of 2-6 clear sentences, using fewer sentences when "
+                "the context is short. Cover the main contribution, methods, "
+                "and key results/findings only when they are stated. If a "
+                "Results / Findings section is present, use it as stronger "
+                "evidence than the abstract. Use only facts stated in the "
+                "context. Do not invent or give examples of model architectures, "
+                "baselines, datasets, metrics, or citations. Do not use bullets. "
+                "Do not use speculative words such as likely, probably, "
+                "presumably, or assuming.\n\n"
                 f"Paper context:\n{text}"
             )
-            return self._generate(prompt, max_new_tokens=250)
+            return self._generate(prompt, max_new_tokens=180)
 
         chunk_summaries = []
         for index, chunk in enumerate(chunks, start=1):
             prompt = (
                 "Summarize this section of a research paper in 2-3 concise "
-                "sentences. Preserve concrete methods, results/findings, and limitations.\n\n"
+                "sentences. Preserve concrete methods, results/findings, and "
+                "limitations. Use only facts stated in the section; do not infer "
+                "unstated architectures, baselines, datasets, metrics, or "
+                "citations. Do not use speculative words such as likely, "
+                "probably, presumably, or assuming.\n\n"
                 f"Section {index} of {len(chunks)}:\n{chunk}"
             )
             chunk_summaries.append(self._generate(prompt, max_new_tokens=180))
@@ -165,12 +196,22 @@ class Summarizer:
             for index, summary in enumerate(chunk_summaries, start=1)
         )
         final_prompt = (
-            "Combine the section summaries below into one coherent 4-6 sentence "
-            "summary of the paper. Avoid repetition and focus on the main "
-            "contribution, methods, results/findings, and limitations.\n\n"
+            "Combine the section summaries below into one coherent plain "
+            "paragraph of 2-6 sentences. Avoid repetition and focus on the main "
+            "contribution, methods, results/findings, and limitations only when "
+            "they are stated. Use only facts stated in the summaries; do not "
+            "add unstated details or speculative examples.\n\n"
             f"{combined}"
         )
-        return self._generate(final_prompt, max_new_tokens=280)
+        return self._generate(final_prompt, max_new_tokens=220)
+
+    @modal.method()
+    def smoke_test(self) -> str:
+        return self._summarize_text(
+            "This paper studies satellite precipitation estimation using neural "
+            "networks and reports improved accuracy over a baseline across heavy "
+            "rainfall events."
+        )
 
     def _require_auth(self, authorization: str | None) -> None:
         expected_token = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
@@ -275,3 +316,9 @@ class Summarizer:
             print(f"synthesize generation failed: {exc}")
             return {"error": "Generation failed. Please try again shortly."}
         return {"answer": answer}
+
+
+@app.local_entrypoint()
+def smoke() -> None:
+    summary = Summarizer().smoke_test.remote()
+    print(summary)

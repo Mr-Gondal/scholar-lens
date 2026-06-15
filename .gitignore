@@ -3,3 +3,14 @@ __pycache__/
 *$py.class
 
 .pytest_cache/
+
+.env
+.env.*
+!.env.example
+
+.claude/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/

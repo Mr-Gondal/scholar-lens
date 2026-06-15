@@ -22,7 +22,20 @@ from typing import Any
 import gradio as gr
 import requests
 
+# Load a local .env (if present) so env vars like SEMANTIC_SCHOLAR_API_KEY work
+# for local dev. On Hugging Face Spaces there is no .env; secrets are injected
+# as real env vars, so this is a harmless no-op there.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 APP_TITLE = "Scholar Lens"
+MODEL_ID = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+MODEL_DISPLAY_NAME = "NVIDIA Llama-Nemotron-Nano 8B"
+MODEL_PROVIDER_BADGE = "Powered by NVIDIA Nemotron on Modal"
 SEARCH_LIMIT_PER_SOURCE = 10
 CONSTELLATION_OPENALEX_LIMIT = 200
 CONSTELLATION_MAX_EDGES = 700
@@ -33,9 +46,13 @@ RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 # Identifies us to the OpenAlex / Crossref "polite pool" for faster, more
 # reliable responses. Replace with your own email if you like.
 CONTACT_EMAIL = os.getenv("SCHOLAR_LENS_CONTACT_EMAIL", "scholar-lens@example.com").strip()
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
 MODAL_SUMMARIZE_URL = os.getenv("MODAL_SUMMARIZE_URL", "").strip()
 MODAL_SYNTHESIZE_URL = os.getenv("MODAL_SYNTHESIZE_URL", "").strip()
 MODAL_API_TOKEN = os.getenv("SCHOLAR_LENS_MODAL_TOKEN", "").strip()
+# Optional Semantic Scholar API key (set via HF Space secret). With a key the
+# Graph API is far less rate-limited; without one the source is simply skipped.
+SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
 # How many retrieved papers (that actually have an abstract) to feed the model.
 SYNTHESIS_PAPER_COUNT = 6
 # Results shown per page in the Search results table.
@@ -44,6 +61,7 @@ RESULTS_PER_PAGE = 10
 MAX_ABSTRACT_CHARS = 1400
 MAX_ABSTRACT_TOKENS = 350
 SEARCH_QUERY_CHAR_LIMIT = 300
+MAX_SEARCH_KEYWORDS = 6
 ASK_QUESTION_CHAR_LIMIT = 1200
 ASK_QUESTION_TOKEN_LIMIT = 300
 SUMMARY_INPUT_CHAR_LIMIT = 60000
@@ -53,7 +71,7 @@ SYNTHESIS_CONTEXT_TOKEN_LIMIT = 7000
 DEFAULT_ASK_ANSWER = "Your grounded, cited answer will appear here."
 DEFAULT_LOAD_STATUS = "Select a paper to summarize."
 DEFAULT_PAPER_CHAT_ANSWER = "Ask a question about the selected or pasted paper."
-DEFAULT_COMPARE_ANSWER = "Search papers, choose any two, then compare them with AI."
+DEFAULT_COMPARE_ANSWER = "Search papers, choose any two, then compare them with NVIDIA Nemotron."
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
 FUZZY_TITLE_THRESHOLD = 0.94
 EXPORT_DIR = Path(tempfile.gettempdir()) / "scholar-lens-exports"
@@ -73,8 +91,8 @@ RUBRIC_PROOF_POINTS = [
         "Validated with a real atmospheric-science researcher using their own research questions.",
     ),
     (
-        "Small-model fit",
-        "Qwen2.5 3B only synthesizes retrieved abstracts, so the model is load-bearing without needing broad world knowledge.",
+        "NVIDIA Nemotron fit",
+        f"{MODEL_DISPLAY_NAME} only synthesizes retrieved abstracts, so the model is load-bearing without needing broad world knowledge.",
     ),
     (
         "Product polish",
@@ -133,28 +151,25 @@ GRAPH_STOPWORDS = SEARCH_STOPWORDS | {
     "study",
     "using",
 }
-COMMUNITY_HINTS = [
-    ("Foundations & Graph Theory", {"graph", "theory", "topology", "small-world", "modularity", "community"}),
-    ("Resting-State fMRI & Default Mode", {"resting", "fmri", "default", "bold", "functional"}),
-    ("Structural Connectivity & dMRI", {"structural", "diffusion", "dmri", "tractography", "white", "matter"}),
-    ("Dynamic FC & Brain States", {"dynamic", "state", "states", "temporal", "time", "variability"}),
-    ("Clinical Applications", {"clinical", "disease", "disorder", "alzheimer", "autism", "schizophrenia"}),
-    ("Hubs, Rich-Club & Gradients", {"hub", "hubs", "rich-club", "gradient", "gradients", "hierarchy"}),
-    ("Precision Mapping & Individuality", {"individual", "subject", "personalized", "precision", "fingerprint"}),
-    ("Methods, Tools & Parcellations", {"method", "methods", "atlas", "parcellation", "tool", "pipeline"}),
-    ("Recent Advances", {"deep", "learning", "machine", "prediction", "generative", "transformer"}),
-]
 JEWEL_COLORS = [
-    "#6d8cff",
-    "#64d2ad",
-    "#9ac36a",
-    "#c77dbb",
-    "#d2944a",
-    "#65a6c9",
-    "#d5b94f",
-    "#57bbb4",
-    "#9b7bd3",
+    "#48b6ff",
+    "#ff5fb7",
+    "#66e28f",
+    "#ffd166",
+    "#9b8cff",
+    "#ff7a59",
+    "#3ee8d4",
+    "#f55f8d",
+    "#a6e35f",
+    "#f0f4ff",
 ]
+EDGE_TYPE_PRIORITY = {
+    "direct_citation": 0,
+    "bibliographic_coupling": 1,
+    "co_citation": 2,
+    "topic_similarity": 3,
+    "keyword_cooccurrence": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -233,6 +248,25 @@ def _search_terms(query: str) -> list[str]:
         seen.add(word)
         terms.append(word)
     return terms
+
+
+def _split_search_queries(query: str) -> list[str]:
+    """Accept one topic or several comma/newline/semicolon separated keyword phrases."""
+    parts = re.split(r"[\n;,]+", query or "")
+    queries: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        clean = " ".join(part.split())
+        if not clean:
+            continue
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(clean)
+    if not queries and query.strip():
+        queries.append(" ".join(query.split()))
+    return queries[:MAX_SEARCH_KEYWORDS]
 
 
 def _extract_search_query(question: str) -> str:
@@ -444,21 +478,55 @@ def _keyword_tokens(*texts: str, limit: int = 10) -> list[str]:
 
 
 def _community_label(keywords: list[str]) -> str:
-    keyword_set = set(keywords)
-    best_label = "Methods, Tools & Parcellations"
-    best_score = 0
-    for label, hints in COMMUNITY_HINTS:
-        score = len(keyword_set & hints)
-        if score > best_score:
-            best_label = label
-            best_score = score
-    return best_label
+    if not keywords:
+        return "Unlabeled Topic"
+    cleaned = [keyword.replace("-", " ").title() for keyword in keywords[:2]]
+    return " / ".join(cleaned)
+
+
+def _openalex_topic_labels(work: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    primary_topic = work.get("primary_topic") or {}
+    if primary_topic.get("display_name"):
+        labels.append(primary_topic["display_name"])
+    for field_name in ("topics", "keywords"):
+        for item in work.get(field_name, []) or []:
+            label = item.get("display_name")
+            if label and label not in labels:
+                labels.append(label)
+    return labels[:8]
+
+
+def _topic_similarity_edges(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[str]] = {}
+    for node in nodes:
+        for label in node.get("topic_labels", [])[:5]:
+            buckets.setdefault(label, []).append(node["id"])
+
+    edges: dict[tuple[str, str], dict[str, Any]] = {}
+    for label, ids in buckets.items():
+        if len(ids) < 2 or len(ids) > 50:
+            continue
+        for source, target in itertools.combinations(sorted(ids), 2):
+            key = (source, target)
+            if key not in edges:
+                edges[key] = {
+                    "source": source,
+                    "target": target,
+                    "weight": 0,
+                    "type": "topic_similarity",
+                    "label": label,
+                }
+            edges[key]["weight"] += 1
+    return _top_weighted_edges(edges)
 
 
 def _assign_graph_communities(nodes: list[dict[str, Any]]) -> None:
     label_to_id: dict[str, int] = {}
     for node in nodes:
-        label = _community_label(node.get("keywords", []))
+        label = _safe_text(node.get("topic_label"), "")
+        if not label:
+            label = _community_label(node.get("keywords", []))
         if label not in label_to_id:
             label_to_id[label] = len(label_to_id)
         community = label_to_id[label]
@@ -471,7 +539,7 @@ def _top_weighted_edges(edges: dict[tuple[str, str], dict[str, Any]]) -> list[di
     ranked = sorted(
         edges.values(),
         key=lambda edge: (
-            0 if edge["type"] == "direct_citation" else 1 if edge["type"] == "co_citation" else 2,
+            EDGE_TYPE_PRIORITY.get(edge["type"], 9),
             -edge["weight"],
         ),
     )
@@ -509,7 +577,9 @@ def _constellation_payload(
     edges: list[dict[str, Any]],
     source: str,
     direct_edges: int,
+    bibliographic_edges: int,
     co_citation_edges: int,
+    topic_similarity_edges: int,
     fallback_used: bool,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -521,7 +591,12 @@ def _constellation_payload(
     for node in nodes:
         node["degree"] = degrees[node["id"]]
 
-    communities = Counter(node["community_label"] for node in nodes)
+    community_labels_by_id: dict[int, str] = {}
+    community_counts: Counter[int] = Counter()
+    for node in nodes:
+        community_id = int(node["community"])
+        community_labels_by_id[community_id] = node["community_label"]
+        community_counts[community_id] += 1
     return {
         "query": query,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -530,23 +605,25 @@ def _constellation_payload(
         "edges": edges,
         "communities": [
             {
-                "id": index,
-                "label": label,
+                "id": community_id,
+                "label": community_labels_by_id[community_id],
                 "count": count,
-                "color": JEWEL_COLORS[index % len(JEWEL_COLORS)],
+                "color": JEWEL_COLORS[community_id % len(JEWEL_COLORS)],
             }
-            for index, (label, count) in enumerate(communities.most_common())
+            for community_id, count in community_counts.most_common()
         ],
         "data_completeness": {
             "paper_count": len(nodes),
             "edge_count": len(edges),
             "direct_citation_edges": direct_edges,
+            "bibliographic_coupling_edges": bibliographic_edges,
             "co_citation_edges": co_citation_edges,
+            "topic_similarity_edges": topic_similarity_edges,
             "keyword_fallback_used": fallback_used,
             "edge_policy": (
-                "OpenAlex direct citation + co-citation only"
+                "OpenAlex citation, shared-reference, and co-citation relationships"
                 if not fallback_used
-                else "Keyword co-occurrence fallback because retrieved citation links were sparse"
+                else "Topic/keyword similarity fallback because retrieved citation links were sparse"
             ),
             "max_edges": CONSTELLATION_MAX_EDGES,
             "warnings": warnings or [],
@@ -571,6 +648,8 @@ def build_constellation_from_papers(
                 "url": paper.url,
                 "doi": paper.doi,
                 "abstract": paper.abstract,
+                "topic_label": "",
+                "topic_labels": [],
                 "keywords": _keyword_tokens(paper.title, paper.abstract, limit=10),
             }
         )
@@ -581,9 +660,11 @@ def build_constellation_from_papers(
         edges=edges,
         source="Current search results",
         direct_edges=0,
+        bibliographic_edges=0,
         co_citation_edges=0,
+        topic_similarity_edges=0,
         fallback_used=True,
-        warnings=["Search-result records do not include reference lists, so keyword fallback is used."],
+        warnings=["Search-result records do not include reference lists, so keyword similarity is used."],
     )
 
 
@@ -602,11 +683,11 @@ def fetch_openalex_constellation(
         "mailto": CONTACT_EMAIL,
         "select": (
             "id,doi,title,publication_year,authorships,cited_by_count,"
-            "referenced_works,abstract_inverted_index,primary_location,concepts"
+            "referenced_works,abstract_inverted_index,primary_location,primary_topic,topics,keywords"
         ),
     }
     try:
-        payload = _request_json("https://api.openalex.org/works", params)
+        payload = _request_json("https://api.openalex.org/works", _openalex_params(params))
     except requests.RequestException:
         return None, "OpenAlex is unavailable right now, so the constellation could not be built."
 
@@ -622,11 +703,7 @@ def fetch_openalex_constellation(
             for authorship in work.get("authorships", [])
         ]
         abstract = _reconstruct_abstract(work.get("abstract_inverted_index"))
-        concepts = [
-            concept.get("display_name", "")
-            for concept in work.get("concepts", [])
-            if concept.get("display_name")
-        ]
+        topic_labels = _openalex_topic_labels(work)
         location = work.get("primary_location") or {}
         landing_page = _safe_text(
             work.get("doi")
@@ -652,7 +729,9 @@ def fetch_openalex_constellation(
                 "url": landing_page,
                 "doi": _normalize_doi(work.get("doi", "")),
                 "abstract": abstract,
-                "keywords": _keyword_tokens(" ".join(concepts), work.get("title", ""), abstract, limit=12),
+                "topic_label": topic_labels[0] if topic_labels else "",
+                "topic_labels": topic_labels,
+                "keywords": _keyword_tokens(" ".join(topic_labels), work.get("title", ""), abstract, limit=12),
             }
         )
 
@@ -673,6 +752,30 @@ def fetch_openalex_constellation(
             }
             direct_edges += 1
 
+    bibliographic_edges = 0
+    shared_reference_pairs: Counter[tuple[str, str]] = Counter()
+    reference_buckets: dict[str, list[str]] = {}
+    for work_id, references in references_by_id.items():
+        for reference in references:
+            reference_buckets.setdefault(reference, []).append(work_id)
+    for cited_work, citing_ids in reference_buckets.items():
+        if len(citing_ids) < 2 or len(citing_ids) > 60:
+            continue
+        for source, target in itertools.combinations(sorted(citing_ids), 2):
+            shared_reference_pairs[(source, target)] += 1
+    for (source, target), weight in shared_reference_pairs.items():
+        key = tuple(sorted((source, target)))
+        if key in edge_map or weight < 2:
+            continue
+        edge_map[key] = {
+            "source": source,
+            "target": target,
+            "weight": weight,
+            "type": "bibliographic_coupling",
+            "label": f"{weight} shared references",
+        }
+        bibliographic_edges += 1
+
     co_cited_edges = 0
     co_citation_pairs: Counter[tuple[str, str]] = Counter()
     for references in references_by_id.values():
@@ -692,9 +795,10 @@ def fetch_openalex_constellation(
         }
         co_cited_edges += 1
 
-    fallback_used = direct_edges + co_cited_edges < max(8, len(nodes) // 18)
+    evidence_edges = direct_edges + bibliographic_edges + co_cited_edges
+    fallback_used = evidence_edges < max(8, len(nodes) // 18)
     if fallback_used:
-        edges = _keyword_edges(nodes)
+        edges = _topic_similarity_edges(nodes) or _keyword_edges(nodes)
     else:
         edges = _top_weighted_edges(edge_map)
 
@@ -705,7 +809,9 @@ def fetch_openalex_constellation(
             edges=edges,
             source="OpenAlex",
             direct_edges=direct_edges,
+            bibliographic_edges=bibliographic_edges,
             co_citation_edges=co_cited_edges,
+            topic_similarity_edges=len(edges) if fallback_used else 0,
             fallback_used=fallback_used,
             warnings=[] if not fallback_used else ["Citation links among retrieved papers were sparse."],
         ),
@@ -720,7 +826,19 @@ def export_corpus_zip(graph: dict[str, Any] | None) -> str | None:
     records = [
         {
             key: node.get(key, "")
-            for key in ("id", "title", "year", "authors", "citations", "url", "doi", "abstract", "keywords")
+            for key in (
+                "id",
+                "title",
+                "year",
+                "authors",
+                "citations",
+                "url",
+                "doi",
+                "abstract",
+                "topic_label",
+                "topic_labels",
+                "keywords",
+            )
         }
         for node in graph.get("nodes", [])
     ]
@@ -858,6 +976,13 @@ def _request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
+def _openalex_params(params: dict[str, Any]) -> dict[str, Any]:
+    request_params = dict(params)
+    if OPENALEX_API_KEY:
+        request_params["api_key"] = OPENALEX_API_KEY
+    return request_params
+
+
 def _reconstruct_abstract(inverted_index: dict[str, list[int]] | None) -> str:
     """Rebuild plain text from OpenAlex's abstract inverted index.
 
@@ -882,6 +1007,42 @@ def _strip_markup(text: str) -> str:
 def _normalize_doi(value: str) -> str:
     doi = (value or "").lower().strip()
     return re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+
+
+def search_semantic_scholar(query: str) -> tuple[list[PaperResult], str | None]:
+    # Requires SEMANTIC_SCHOLAR_API_KEY to be reliable; skip cleanly if absent.
+    if not SEMANTIC_SCHOLAR_API_KEY:
+        return [], None
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {
+        "query": query,
+        "limit": SEARCH_LIMIT_PER_SOURCE,
+        "fields": "title,year,authors,citationCount,url,abstract,externalIds",
+    }
+    headers = {"Accept": "application/json", "x-api-key": SEMANTIC_SCHOLAR_API_KEY}
+    try:
+        response = _get_with_retries(url, params, headers=headers)
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return [], "Semantic Scholar is unavailable right now."
+
+    results: list[PaperResult] = []
+    for paper in payload.get("data") or []:
+        authors = [author.get("name", "") for author in paper.get("authors", [])]
+        external_ids = paper.get("externalIds") or {}
+        results.append(
+            PaperResult(
+                title=_safe_text(paper.get("title"), "Untitled paper"),
+                year=_safe_text(paper.get("year")),
+                source="Semantic Scholar",
+                authors=_shorten_authors(authors),
+                citations=_safe_text(paper.get("citationCount"), "0"),
+                url=_safe_text(paper.get("url"), "#"),
+                abstract=_safe_text(paper.get("abstract"), ""),
+                doi=_normalize_doi(external_ids.get("DOI", "")),
+            )
+        )
+    return results, None
 
 
 def search_openalex(query: str) -> tuple[list[PaperResult], str | None]:
@@ -1073,6 +1234,7 @@ def _fetch_pubmed_abstracts(paper_ids: list[str]) -> dict[str, str]:
 
 def _source_badge(source: str) -> str:
     config = {
+        "Semantic Scholar": ("semantic", "🧠"),
         "OpenAlex": ("openalex", "🌐"),
         "Crossref": ("crossref", "🔗"),
         "arXiv": ("arxiv", "📐"),
@@ -1193,9 +1355,15 @@ def _dedupe_results(results: list[PaperResult]) -> list[PaperResult]:
     return unique
 
 
-def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
-    """Query every source in parallel, then de-duplicate and rank results."""
-    search_functions = [search_openalex, search_crossref, search_arxiv, search_pubmed]
+def _collect_single_query_results(query: str) -> tuple[list[PaperResult], list[str]]:
+    """Query every source in parallel for one keyword phrase."""
+    search_functions = [
+        search_semantic_scholar,
+        search_openalex,
+        search_crossref,
+        search_arxiv,
+        search_pubmed,
+    ]
     results: list[PaperResult] = []
     warnings: list[str] = []
 
@@ -1215,6 +1383,25 @@ def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
     return _rank_results(results, query), warnings
 
 
+def _collect_results(query: str) -> tuple[list[PaperResult], list[str]]:
+    """Query one or more keyword phrases, then de-duplicate and rank results."""
+    queries = _split_search_queries(query)
+    if not queries:
+        return [], []
+    if len(queries) == 1:
+        return _collect_single_query_results(queries[0])
+
+    results: list[PaperResult] = []
+    warnings: list[str] = []
+    for search_query in queries:
+        source_results, source_warnings = _collect_single_query_results(search_query)
+        results.extend(source_results)
+        warnings.extend(source_warnings)
+
+    combined_query = " ".join(queries)
+    return _rank_results(_dedupe_results(results), combined_query), warnings
+
+
 def _selector_choices(results: list[PaperResult]) -> list[str]:
     return [f"{index + 1}. {result.title}" for index, result in enumerate(results)]
 
@@ -1229,12 +1416,13 @@ def _compare_selector_updates(results: list[PaperResult]) -> tuple[gr.Dropdown, 
 
 def search_all_sources(query: str):
     clean_query = query.strip()
+    search_queries = _split_search_queries(clean_query)
     if not clean_query:
         table, label, page = _page_view([], 0)
         prev_update, next_update = _pagination_updates([], page)
         compare_left, compare_right = _compare_selector_updates([])
         return (
-            "Enter a research topic to search OpenAlex, Crossref, arXiv, and PubMed.",
+            "Enter one research topic, or multiple keyword phrases separated by commas or new lines.",
             table,
             "",
             [],
@@ -1267,6 +1455,11 @@ def search_all_sources(query: str):
         )
 
     results, warnings = _collect_results(clean_query)
+    query_note = (
+        f" across **{len(search_queries)}** keyword searches"
+        if len(search_queries) > 1
+        else " across all sources"
+    )
 
     if warnings and results:
         status = f"✓ Found **{len(results)}** papers. " + " ".join(warnings)
@@ -1280,6 +1473,11 @@ def search_all_sources(query: str):
             status = "No papers could be loaded because the source APIs are unavailable right now. " + " ".join(warnings)
         else:
             status = "No papers found. Try a broader research topic or a different phrase."
+
+    if results:
+        status = f"Found **{len(results)}** papers{query_note}."
+        if warnings:
+            status += " " + " ".join(warnings)
 
     table, label, page = _page_view(results, 0)
     prev_update, next_update = _pagination_updates(results, page)
@@ -1574,6 +1772,20 @@ def summarize_selected_paper(
     return paper_text, load_status, summarize_with_modal(paper_text), tab_update
 
 
+def load_selected_paper_reset_chat(
+    selected_index: Any,
+    results: list[PaperResult],
+) -> tuple[str, str, str, gr.Tabs, str, str, str]:
+    try:
+        index = int(selected_index)
+    except (TypeError, ValueError):
+        index = None
+    paper_text, load_status, summary, tab_update = load_selected_paper(index, results)
+    if paper_text and not summary:
+        summary = "Paper loaded. Click Summarize with AI to generate the summary."
+    return paper_text, load_status, summary, tab_update, "", "", DEFAULT_PAPER_CHAT_ANSWER
+
+
 def summarize_row_selection(
     selected_index: Any,
     results: list[PaperResult],
@@ -1613,7 +1825,7 @@ def _empty_constellation_html(message: str = "Build a constellation to explore p
     safe_message = html.escape(message)
     return f"""
     <div class="constellation-empty">
-        <h3>Connectome Constellation</h3>
+        <h3>Literature Constellation</h3>
         <p>{safe_message}</p>
     </div>
     """
@@ -1632,216 +1844,301 @@ def _render_constellation_html(graph: dict[str, Any] | None) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; color: #f8fafc; font-family: Inter, Arial, sans-serif; }}
-#app {{ position: relative; width: 100vw; height: 100vh; overflow: hidden; background: radial-gradient(circle at 50% 35%, rgba(36,52,88,.32), transparent 32%), #000; }}
-#stage {{ position: absolute; inset: 0; }}
-.top {{ position: absolute; top: 26px; left: 36px; right: 36px; text-align: center; pointer-events: none; z-index: 4; }}
-.eyebrow {{ position: absolute; left: 0; top: 6px; color: #d6ad4f; letter-spacing: 4px; font: 700 12px/1 monospace; text-align: left; }}
-h1 {{ margin: 42px 0 8px; font: italic 700 clamp(30px, 4vw, 54px)/1 Georgia, serif; color: rgba(255,255,255,.92); text-shadow: 0 0 24px rgba(255,255,255,.2); }}
-.meta {{ color: rgba(255,255,255,.48); font: 700 13px/1.5 monospace; letter-spacing: 1px; }}
-.stats {{ position: absolute; left: 32px; bottom: 32px; display: grid; grid-template-columns: repeat(3, minmax(96px, 1fr)); gap: 14px; padding: 18px 20px; background: rgba(5,7,14,.74); border: 1px solid rgba(255,255,255,.1); border-radius: 8px; backdrop-filter: blur(14px); z-index: 5; }}
-.stat strong {{ display: block; color: #d6ad4f; font: 800 22px/1.1 monospace; }}
-.stat span {{ color: rgba(255,255,255,.45); font: 700 10px/1.4 monospace; letter-spacing: 1px; text-transform: uppercase; }}
-.legend {{ position: absolute; right: 28px; bottom: 32px; width: min(390px, 33vw); max-height: 42vh; overflow: auto; padding: 18px 20px; background: rgba(5,7,14,.76); border: 1px solid rgba(255,255,255,.1); border-radius: 8px; backdrop-filter: blur(14px); z-index: 6; }}
-.legend-title {{ color: rgba(255,255,255,.42); font: 800 10px/1.5 monospace; letter-spacing: 3px; margin-bottom: 12px; }}
-.legend-row {{ display: grid; grid-template-columns: 14px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; cursor: pointer; color: rgba(255,255,255,.72); font: 700 12px/1.25 monospace; }}
-.dot {{ width: 11px; height: 11px; border-radius: 50%; box-shadow: 0 0 15px currentColor; }}
+html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #02030a; color: #f8fafc; font-family: Inter, Arial, sans-serif; }}
+#app {{ position: relative; width: 100vw; height: 100vh; overflow: hidden; background: radial-gradient(circle at 48% 42%, rgba(42, 75, 140, .22), transparent 34%), linear-gradient(135deg, #02030a 0%, #070816 58%, #02030a 100%); }}
+canvas {{ position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }}
+canvas.dragging {{ cursor: grabbing; }}
+.top {{ position: absolute; top: 22px; left: 28px; right: 28px; pointer-events: none; z-index: 4; display: flex; justify-content: space-between; gap: 24px; align-items: start; }}
+.brand {{ color: rgba(255,255,255,.46); font: 800 10px/1.4 monospace; letter-spacing: 3px; text-transform: uppercase; }}
+h1 {{ margin: 5px 0 6px; font: italic 700 clamp(28px, 4vw, 52px)/1 Georgia, serif; color: rgba(255,255,255,.94); text-shadow: 0 0 28px rgba(72,182,255,.22); }}
+.meta {{ color: rgba(255,255,255,.58); font: 700 12px/1.45 monospace; letter-spacing: .7px; max-width: 680px; }}
+.controls {{ pointer-events: auto; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; max-width: 380px; }}
+.chip {{ border: 1px solid rgba(255,255,255,.12); color: rgba(255,255,255,.74); background: rgba(5,7,18,.62); border-radius: 999px; padding: 8px 11px; font: 800 10px/1 monospace; letter-spacing: 1px; backdrop-filter: blur(12px); }}
+.chip.active {{ color: #06111f; background: #48b6ff; border-color: rgba(72,182,255,.8); box-shadow: 0 0 22px rgba(72,182,255,.32); }}
+.legend {{ position: absolute; right: 24px; bottom: 26px; width: min(330px, 30vw); max-height: 38vh; overflow: auto; padding: 14px 16px; background: rgba(5,7,18,.72); border: 1px solid rgba(255,255,255,.12); border-radius: 8px; backdrop-filter: blur(16px); z-index: 6; }}
+.legend-title {{ color: rgba(255,255,255,.44); font: 800 10px/1.5 monospace; letter-spacing: 2px; margin-bottom: 8px; }}
+.legend-row {{ display: grid; grid-template-columns: 13px 1fr auto; gap: 9px; align-items: center; padding: 6px 0; cursor: pointer; color: rgba(255,255,255,.72); font: 700 11px/1.25 monospace; }}
+.dot {{ width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 16px currentColor; }}
 .legend-row:hover, .legend-row.active {{ color: #fff; }}
-.detail {{ position: absolute; top: 170px; right: 28px; width: min(430px, 34vw); max-height: 56vh; overflow: auto; padding: 18px 20px; background: rgba(5,7,14,.88); border: 1px solid rgba(214,173,79,.3); border-radius: 8px; box-shadow: 0 0 32px rgba(214,173,79,.08); z-index: 7; display: none; }}
-.detail h2 {{ margin: 0 0 8px; font: 700 18px/1.2 Georgia, serif; }}
-.detail .byline {{ color: rgba(255,255,255,.55); font: 700 11px/1.5 monospace; margin-bottom: 12px; }}
-.detail p {{ color: rgba(255,255,255,.76); font: 13px/1.55 Arial, sans-serif; }}
-.detail a {{ display: inline-flex; margin-top: 10px; color: #f1c863; text-decoration: none; font-weight: 800; }}
-.completeness {{ position: absolute; left: 50%; transform: translateX(-50%); bottom: 18px; color: rgba(255,255,255,.42); font: 700 10px/1.4 monospace; letter-spacing: 1px; z-index: 5; pointer-events: none; }}
-@media (max-width: 820px) {{ .eyebrow {{ position: static; text-align: center; }} .top {{ left: 16px; right: 16px; }} .stats {{ grid-template-columns: repeat(2, 1fr); left: 14px; bottom: 14px; max-width: 48vw; }} .legend {{ right: 14px; bottom: 14px; width: 42vw; }} .detail {{ left: 14px; right: 14px; width: auto; top: 142px; }} }}
+.detail {{ position: absolute; top: 132px; right: 24px; width: min(420px, 32vw); max-height: 54vh; overflow: auto; padding: 17px 19px; background: rgba(5,7,18,.88); border: 1px solid rgba(72,182,255,.28); border-radius: 8px; box-shadow: 0 0 34px rgba(72,182,255,.12); z-index: 7; display: none; }}
+.detail h2 {{ margin: 0 0 8px; font: 700 18px/1.22 Georgia, serif; color: #fff; }}
+.detail .byline {{ color: rgba(255,255,255,.58); font: 700 11px/1.55 monospace; margin-bottom: 12px; }}
+.detail .relation {{ color: #66e28f; font: 800 10px/1.4 monospace; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; }}
+.detail p {{ color: rgba(255,255,255,.78); font: 13px/1.55 Arial, sans-serif; }}
+.detail a {{ display: inline-flex; margin-top: 10px; color: #48b6ff; text-decoration: none; font-weight: 800; }}
+.evidence {{ position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); max-width: min(720px, 72vw); padding: 9px 13px; border-radius: 999px; background: rgba(5,7,18,.66); border: 1px solid rgba(255,255,255,.12); color: rgba(255,255,255,.62); font: 800 10px/1.35 monospace; letter-spacing: 1px; text-align: center; backdrop-filter: blur(14px); z-index: 5; pointer-events: none; }}
+@media (max-width: 820px) {{ .top {{ left: 14px; right: 14px; display: block; }} .controls {{ margin-top: 8px; justify-content: flex-start; }} .legend {{ left: 14px; right: 14px; bottom: 14px; width: auto; max-height: 26vh; }} .detail {{ left: 14px; right: 14px; width: auto; top: 156px; max-height: 38vh; }} .evidence {{ display: none; }} }}
 </style>
 </head>
 <body>
 <div id="app">
-  <div id="stage"></div>
+  <canvas id="map"></canvas>
   <div class="top">
-    <div class="eyebrow">LIVING LITERATURE MAP</div>
-    <h1>Connectome Constellation</h1>
-    <div class="meta" id="meta"></div>
+    <div>
+      <div class="brand">CONNECTED LITERATURE MAP</div>
+      <h1>Literature Constellation</h1>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="controls" id="controls"></div>
   </div>
-  <div class="stats" id="stats"></div>
-  <div class="legend" id="legend"><div class="legend-title">LEGEND - DRAG TO ROTATE - SCROLL TO ZOOM</div></div>
+  <div class="legend" id="legend"><div class="legend-title">CLUSTERS - HOVER TO ISOLATE</div></div>
   <div class="detail" id="detail"></div>
-  <div class="completeness" id="completeness"></div>
+  <div class="evidence" id="evidence"></div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
 <script>
 const graph = {graph_json};
-const container = document.getElementById('stage');
-const scene = new THREE.Scene();
-scene.fog = new THREE.FogExp2(0x000000, 0.00075);
-const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 1, 6000);
-camera.position.set(0, 0, 2200);
-const renderer = new THREE.WebGLRenderer({{ antialias: true, alpha: false }});
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setSize(innerWidth, innerHeight);
-container.appendChild(renderer.domElement);
-const controls = new THREE.OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.045;
-controls.autoRotate = true;
-controls.autoRotateSpeed = 0.36;
-controls.minDistance = 260;
-controls.maxDistance = 2600;
-renderer.domElement.addEventListener('wheel', (event) => event.preventDefault(), {{ passive: false }});
-const composer = new THREE.EffectComposer(renderer);
-composer.addPass(new THREE.RenderPass(scene, camera));
-const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.35, 0.56, 0.2);
-composer.addPass(bloom);
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-const nodeSprites = [];
+function escapeHtml(value) {{ return String(value || '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}}[ch])); }}
+function escapeAttr(value) {{ return escapeHtml(value).replace(/`/g, '&#096;'); }}
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
 const nodeById = new Map();
 const neighbors = new Map();
 let activeCommunity = null;
 let selectedId = null;
-
-function glowTexture(color) {{
-  const canvas = document.createElement('canvas');
-  canvas.width = 128; canvas.height = 128;
-  const ctx = canvas.getContext('2d');
-  const grad = ctx.createRadialGradient(64,64,0,64,64,64);
-  grad.addColorStop(0, 'rgba(255,255,255,1)');
-  grad.addColorStop(.14, color);
-  grad.addColorStop(.45, color.replace(')', ', .38)').replace('rgb', 'rgba'));
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0,0,128,128);
-  return new THREE.CanvasTexture(canvas);
-}}
-function hexToRgb(hex) {{
-  const num = parseInt(hex.slice(1), 16);
-  return `rgb(${{(num >> 16) & 255}},${{(num >> 8) & 255}},${{num & 255}})`;
-}}
-function positionFor(i, n, degree) {{
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  const y = 1 - (i / Math.max(1, n - 1)) * 2;
-  const radius = Math.sqrt(Math.max(0, 1 - y * y));
-  const theta = i * golden;
-  const jitter = 1 + (((i * 37) % 19) - 9) * 0.006;
-  const shell = 360 + Math.min(220, degree * 14);
-  return new THREE.Vector3(
-    Math.cos(theta) * radius * shell * 1.75 * jitter,
-    y * shell * 0.92,
-    Math.sin(theta) * radius * shell * 0.78 * jitter
-  );
-}}
+let hoverId = null;
+let transform = {{ x: 0, y: 0, scale: 1 }};
+let dragStart = null;
+const relationLabels = {{
+  direct_citation: 'Citation',
+  bibliographic_coupling: 'Shared refs',
+  co_citation: 'Co-cited',
+  topic_similarity: 'Topic',
+  keyword_cooccurrence: 'Keyword'
+}};
+const relationColors = {{
+  direct_citation: '#ffffff',
+  bibliographic_coupling: '#48b6ff',
+  co_citation: '#66e28f',
+  topic_similarity: '#ffd166',
+  keyword_cooccurrence: '#9b8cff'
+}};
+let activeRelations = new Set(Object.keys(relationLabels));
 graph.nodes.forEach((node, index) => {{
   nodeById.set(node.id, node);
   neighbors.set(node.id, new Set());
-  node.position = positionFor(index, graph.nodes.length, node.degree || 0);
+  const communityIndex = Math.max(0, graph.communities.findIndex(comm => comm.id === node.community));
+  const angle = (communityIndex / Math.max(1, graph.communities.length)) * Math.PI * 2;
+  const ring = 210 + communityIndex * 9;
+  const jitter = ((index * 73) % 29) - 14;
+  node.x = Math.cos(angle) * ring + Math.cos(index * 1.618) * jitter * 4;
+  node.y = Math.sin(angle) * ring + Math.sin(index * 1.618) * jitter * 4;
+  node.vx = 0;
+  node.vy = 0;
+  node.radius = 5 + Math.min(18, Math.sqrt(Math.max(0, Number(node.citations) || 0)) * .65) + Math.min(8, Math.sqrt((node.degree || 0) + 1));
 }});
 graph.edges.forEach(edge => {{
   if (neighbors.has(edge.source)) neighbors.get(edge.source).add(edge.target);
   if (neighbors.has(edge.target)) neighbors.get(edge.target).add(edge.source);
 }});
-const edgePositions = [];
-graph.edges.forEach(edge => {{
-  const a = nodeById.get(edge.source), b = nodeById.get(edge.target);
-  if (!a || !b) return;
-  edgePositions.push(a.position.x, a.position.y, a.position.z, b.position.x, b.position.y, b.position.z);
-}});
-const edgeGeometry = new THREE.BufferGeometry();
-edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-const edgeMaterial = new THREE.LineBasicMaterial({{ color: 0xd6ad4f, transparent: true, opacity: 0.12, depthWrite: false, blending: THREE.AdditiveBlending }});
-scene.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
-graph.nodes.forEach(node => {{
-  const material = new THREE.SpriteMaterial({{ map: glowTexture(hexToRgb(node.color)), transparent: true, opacity: .88, depthWrite: false, blending: THREE.AdditiveBlending }});
-  const sprite = new THREE.Sprite(material);
-  sprite.position.copy(node.position);
-  const size = 18 + Math.min(48, Math.sqrt((node.degree || 0) + 1) * 7);
-  sprite.scale.set(size, size, 1);
-  sprite.userData.node = node;
-  nodeSprites.push(sprite);
-  scene.add(sprite);
-}});
-const stars = new THREE.BufferGeometry();
-const starPositions = [];
-for (let i = 0; i < 1400; i++) {{
-  starPositions.push((Math.random() - .5) * 3600, (Math.random() - .5) * 2100, (Math.random() - .5) * 2600);
+function edgeDistance(type) {{
+  return type === 'direct_citation' ? 82 : type === 'bibliographic_coupling' ? 112 : type === 'co_citation' ? 126 : type === 'topic_similarity' ? 148 : 162;
 }}
-stars.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
-scene.add(new THREE.Points(stars, new THREE.PointsMaterial({{ color: 0x9fb7ff, size: 1.15, transparent: true, opacity: .38 }})));
-function refreshNodes() {{
+function runLayout() {{
+  const nodes = graph.nodes;
+  for (let step = 0; step < 260; step++) {{
+    for (let i = 0; i < nodes.length; i++) {{
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {{
+        const b = nodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist2 = dx * dx + dy * dy + .01;
+        let force = 1550 / dist2;
+        let dist = Math.sqrt(dist2);
+        let fx = (dx / dist) * force;
+        let fy = (dy / dist) * force;
+        a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
+      }}
+    }}
+    graph.edges.forEach(edge => {{
+      const a = nodeById.get(edge.source), b = nodeById.get(edge.target);
+      if (!a || !b) return;
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      let wanted = edgeDistance(edge.type) - Math.min(36, Math.log1p(edge.weight || 1) * 9);
+      let force = (dist - wanted) * (.006 + Math.min(.018, (edge.weight || 1) * .0015));
+      let fx = (dx / dist) * force;
+      let fy = (dy / dist) * force;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }});
+    nodes.forEach(node => {{
+      const angle = (node.community / Math.max(1, graph.communities.length)) * Math.PI * 2;
+      const anchorX = Math.cos(angle) * 260;
+      const anchorY = Math.sin(angle) * 190;
+      node.vx += (anchorX - node.x) * .002;
+      node.vy += (anchorY - node.y) * .002;
+      node.x += node.vx;
+      node.y += node.vy;
+      node.vx *= .72;
+      node.vy *= .72;
+    }});
+  }}
+}}
+runLayout();
+function resize() {{
+  canvas.width = Math.floor(innerWidth * devicePixelRatio);
+  canvas.height = Math.floor(innerHeight * devicePixelRatio);
+  canvas.style.width = innerWidth + 'px';
+  canvas.style.height = innerHeight + 'px';
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}}
+function toScreen(node) {{ return {{ x: innerWidth / 2 + (node.x + transform.x) * transform.scale, y: innerHeight / 2 + (node.y + transform.y) * transform.scale }}; }}
+function fromScreen(x, y) {{ return {{ x: (x - innerWidth / 2) / transform.scale - transform.x, y: (y - innerHeight / 2) / transform.scale - transform.y }}; }}
+function visibleNode(node) {{
   const selectedNeighbors = selectedId ? neighbors.get(selectedId) || new Set() : new Set();
-  nodeSprites.forEach(sprite => {{
-    const node = sprite.userData.node;
-    const communityOk = activeCommunity === null || node.community === activeCommunity;
-    const selectedOk = !selectedId || node.id === selectedId || selectedNeighbors.has(node.id);
-    const visible = communityOk && selectedOk;
-    sprite.material.opacity = visible ? .96 : .14;
-    const boost = node.id === selectedId ? 1.9 : selectedNeighbors.has(node.id) ? 1.35 : 1;
-    const base = 18 + Math.min(48, Math.sqrt((node.degree || 0) + 1) * 7);
-    sprite.scale.set(base * boost, base * boost, 1);
+  return (activeCommunity === null || node.community === activeCommunity) && (!selectedId || node.id === selectedId || selectedNeighbors.has(node.id));
+}}
+function edgeVisible(edge) {{
+  if (!activeRelations.has(edge.type)) return false;
+  const a = nodeById.get(edge.source), b = nodeById.get(edge.target);
+  return a && b && visibleNode(a) && visibleNode(b);
+}}
+function draw() {{
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  const grad = ctx.createRadialGradient(innerWidth * .46, innerHeight * .46, 20, innerWidth * .46, innerHeight * .46, Math.max(innerWidth, innerHeight) * .62);
+  grad.addColorStop(0, 'rgba(39,69,132,.28)');
+  grad.addColorStop(1, 'rgba(2,3,10,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, innerWidth, innerHeight);
+  graph.edges.forEach(edge => {{
+    if (!edgeVisible(edge)) return;
+    const a = toScreen(nodeById.get(edge.source));
+    const b = toScreen(nodeById.get(edge.target));
+    const selected = selectedId && (edge.source === selectedId || edge.target === selectedId);
+    ctx.strokeStyle = relationColors[edge.type] || 'rgba(255,255,255,.35)';
+    ctx.globalAlpha = selected ? .68 : edge.type === 'direct_citation' ? .34 : .16;
+    ctx.lineWidth = selected ? 2.4 : Math.max(.55, Math.min(2.4, Math.log1p(edge.weight || 1) * .46));
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
   }});
+  ctx.globalAlpha = 1;
+  graph.nodes.forEach(node => {{
+    const p = toScreen(node);
+    const selected = node.id === selectedId;
+    const hovered = node.id === hoverId;
+    const neighbor = selectedId && (neighbors.get(selectedId) || new Set()).has(node.id);
+    const visible = visibleNode(node);
+    const r = (node.radius * (selected ? 1.45 : hovered ? 1.3 : neighbor ? 1.16 : 1)) * transform.scale;
+    ctx.globalAlpha = visible ? 1 : .14;
+    ctx.fillStyle = node.color || '#48b6ff';
+    ctx.shadowColor = node.color || '#48b6ff';
+    ctx.shadowBlur = visible ? (selected || hovered ? 24 : 13) : 0;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(3, r), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = selected || hovered ? '#fff' : 'rgba(255,255,255,.26)';
+    ctx.lineWidth = selected || hovered ? 2 : 1;
+    ctx.stroke();
+  }});
+  ctx.globalAlpha = 1;
+  const labeled = graph.nodes
+    .filter(node => visibleNode(node))
+    .sort((a, b) => (b.degree || 0) - (a.degree || 0))
+    .slice(0, selectedId || hoverId ? 18 : 10);
+  if (selectedId) labeled.push(nodeById.get(selectedId));
+  if (hoverId) labeled.push(nodeById.get(hoverId));
+  const seen = new Set();
+  labeled.forEach(node => {{
+    if (!node || seen.has(node.id)) return;
+    seen.add(node.id);
+    const p = toScreen(node);
+    const title = String(node.title || 'Untitled paper');
+    const label = title.length > 54 ? title.slice(0, 51) + '...' : title;
+    ctx.font = '700 11px Inter, Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,.86)';
+    ctx.shadowColor = '#02030a';
+    ctx.shadowBlur = 6;
+    ctx.fillText(label, p.x + node.radius + 9, p.y + 4);
+    ctx.shadowBlur = 0;
+  }});
+}}
+function nearestNode(event) {{
+  const rect = canvas.getBoundingClientRect();
+  let best = null;
+  let bestDist = Infinity;
+  graph.nodes.forEach(node => {{
+    const p = toScreen(node);
+    const dx = event.clientX - rect.left - p.x;
+    const dy = event.clientY - rect.top - p.y;
+    const limit = Math.max(13, node.radius * transform.scale + 6);
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < limit && dist < bestDist) {{ best = node; bestDist = dist; }}
+  }});
+  return best;
 }}
 function showDetail(node) {{
   selectedId = node.id;
-  controls.autoRotate = false;
   const detail = document.getElementById('detail');
   detail.style.display = 'block';
-  detail.innerHTML = `<h2>${{escapeHtml(node.title)}}</h2><div class="byline">${{escapeHtml(node.first_author || node.authors)}} - ${{escapeHtml(node.year)}} - ${{escapeHtml(String(node.citations))}} cites</div><p>${{escapeHtml(node.abstract || 'No abstract was available for this paper.')}}</p><a href="${{escapeAttr(node.url || '#')}}" target="_blank" rel="noopener noreferrer">Open paper</a>`;
-  refreshNodes();
+  const connected = Array.from(neighbors.get(node.id) || []).length;
+  detail.innerHTML = `<div class="relation">${{escapeHtml(node.community_label || 'Topic cluster')}} - ${{connected}} nearby papers</div><h2>${{escapeHtml(node.title)}}</h2><div class="byline">${{escapeHtml(node.first_author || node.authors)}} - ${{escapeHtml(node.year)}} - ${{escapeHtml(String(node.citations))}} cites</div><p>${{escapeHtml(node.abstract || 'No abstract was available for this paper.')}}</p><a href="${{escapeAttr(node.url || '#')}}" target="_blank" rel="noopener noreferrer">Open paper</a>`;
+  draw();
 }}
-function escapeHtml(value) {{ return String(value || '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}}[ch])); }}
-function escapeAttr(value) {{ return escapeHtml(value).replace(/`/g, '&#096;'); }}
-function pick(event) {{
-  const rect = renderer.domElement.getBoundingClientRect();
-  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(mouse, camera);
-  const hits = raycaster.intersectObjects(nodeSprites);
-  if (hits.length) showDetail(hits[0].object.userData.node);
-}}
-renderer.domElement.addEventListener('click', pick);
-document.getElementById('meta').textContent = `${{graph.nodes.length}} papers - ${{graph.communities.length}} communities - ${{graph.edges.length}} edges - ${{graph.query}}`;
-document.getElementById('stats').innerHTML = [
-  ['PAPERS', graph.nodes.length],
-  ['EDGES', graph.edges.length],
-  ['DIRECT', graph.data_completeness.direct_citation_edges],
-  ['CO-CITED', graph.data_completeness.co_citation_edges],
-  ['FALLBACK', graph.data_completeness.keyword_fallback_used ? 'YES' : 'NO'],
-  ['MAX EDGES', graph.data_completeness.max_edges]
-].map(([label, value]) => `<div class="stat"><strong>${{value}}</strong><span>${{label}}</span></div>`).join('');
-document.getElementById('completeness').textContent = graph.data_completeness.edge_policy;
+canvas.addEventListener('mousemove', event => {{
+  if (dragStart) {{
+    transform.x = dragStart.originX + (event.clientX - dragStart.x) / transform.scale;
+    transform.y = dragStart.originY + (event.clientY - dragStart.y) / transform.scale;
+    draw();
+    return;
+  }}
+  const node = nearestNode(event);
+  const nextHover = node ? node.id : null;
+  if (nextHover !== hoverId) {{ hoverId = nextHover; draw(); }}
+}});
+canvas.addEventListener('mousedown', event => {{
+  dragStart = {{ x: event.clientX, y: event.clientY, originX: transform.x, originY: transform.y }};
+  canvas.classList.add('dragging');
+}});
+addEventListener('mouseup', () => {{ dragStart = null; canvas.classList.remove('dragging'); }});
+canvas.addEventListener('click', event => {{
+  if (dragStart) return;
+  const node = nearestNode(event);
+  if (node) showDetail(node);
+}});
+canvas.addEventListener('wheel', event => {{
+  event.preventDefault();
+  const point = fromScreen(event.offsetX, event.offsetY);
+  const factor = event.deltaY < 0 ? 1.12 : .9;
+  transform.scale = Math.max(.45, Math.min(2.8, transform.scale * factor));
+  const after = fromScreen(event.offsetX, event.offsetY);
+  transform.x += after.x - point.x;
+  transform.y += after.y - point.y;
+  draw();
+}}, {{ passive: false }});
+document.getElementById('meta').textContent = `${{graph.nodes.length}} papers - ${{graph.communities.length}} clusters - ${{graph.edges.length}} relationships - ${{graph.query}}`;
+document.getElementById('evidence').textContent = graph.data_completeness.edge_policy;
+const controlsEl = document.getElementById('controls');
+Object.entries(relationLabels).forEach(([type, label]) => {{
+  const count = graph.edges.filter(edge => edge.type === type).length;
+  if (!count) return;
+  const button = document.createElement('button');
+  button.className = 'chip active';
+  button.type = 'button';
+  button.textContent = `${{label}} ${{count}}`;
+  button.addEventListener('click', () => {{
+    if (activeRelations.has(type)) {{ activeRelations.delete(type); button.classList.remove('active'); }}
+    else {{ activeRelations.add(type); button.classList.add('active'); }}
+    draw();
+  }});
+  controlsEl.appendChild(button);
+}});
 const legend = document.getElementById('legend');
 graph.communities.forEach(comm => {{
   const row = document.createElement('div');
   row.className = 'legend-row';
   row.innerHTML = `<span class="dot" style="color:${{comm.color}}; background:${{comm.color}}"></span><span>${{escapeHtml(comm.label)}}</span><span>${{comm.count}}</span>`;
-  row.addEventListener('mouseenter', () => {{ activeCommunity = comm.id; refreshNodes(); row.classList.add('active'); }});
-  row.addEventListener('mouseleave', () => {{ activeCommunity = null; refreshNodes(); row.classList.remove('active'); }});
-  row.addEventListener('click', () => {{ activeCommunity = activeCommunity === comm.id ? null : comm.id; refreshNodes(); }});
+  row.addEventListener('mouseenter', () => {{ activeCommunity = comm.id; draw(); row.classList.add('active'); }});
+  row.addEventListener('mouseleave', () => {{ activeCommunity = null; draw(); row.classList.remove('active'); }});
+  row.addEventListener('click', () => {{ activeCommunity = activeCommunity === comm.id ? null : comm.id; draw(); }});
   legend.appendChild(row);
 }});
-function resize() {{
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
-}}
 addEventListener('resize', resize);
-let start = performance.now();
-function animate(now) {{
-  requestAnimationFrame(animate);
-  const t = Math.min(1, (now - start) / 2200);
-  camera.position.z = 2200 - 1200 * (1 - Math.pow(1 - t, 3));
-  controls.update();
-  composer.render();
-}}
-animate(start);
+resize();
 </script>
 </body>
 </html>
@@ -1913,10 +2210,10 @@ def compare_papers_with_ai(
             f"Abstract: {abstract or 'No abstract available.'}"
         )
     prompt = (
-        "Compare these two papers for a researcher. Use only the provided metadata "
-        "and abstracts. Cover: shared problem, method/data differences, claims, "
-        "limitations, which one to read first for which purpose, and open questions. "
-        "If evidence is missing, say so."
+        f"Compare these two papers for a researcher using {MODEL_DISPLAY_NAME}. "
+        "Use only the provided metadata and abstracts. Cover: shared problem, "
+        "method/data differences, claims, limitations, which one to read first "
+        "for which purpose, and open questions. If evidence is missing, say so."
     )
     return synthesize_with_modal(prompt, "\n\n".join(contexts))
 
@@ -2045,10 +2342,34 @@ CUSTOM_CSS = """
 
 /* ===== TABS ===== */
 .tab-nav { border-bottom: 1px solid var(--sl-border) !important; }
+.gradio-container [role="tab"],
+.gradio-container .tab-nav button {
+    background: transparent !important;
+    color: var(--sl-text-bright) !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+}
+/* include :active and :focus-visible so a clicked tab never flashes white */
+.gradio-container [role="tab"]:hover,
+.gradio-container [role="tab"]:focus,
+.gradio-container [role="tab"]:focus-visible,
+.gradio-container [role="tab"]:active,
+.gradio-container .tab-nav button:hover,
+.gradio-container .tab-nav button:focus,
+.gradio-container .tab-nav button:focus-visible,
+.gradio-container .tab-nav button:active {
+    background: rgba(59, 130, 246, 0.18) !important;
+    color: var(--sl-text-bright) !important;
+    border-color: rgba(96, 165, 250, 0.55) !important;
+    box-shadow: inset 0 -2px 0 var(--sl-accent) !important;
+}
+.gradio-container [role="tab"][aria-selected="true"],
+.gradio-container [role="tab"][aria-selected="true"]:active,
 .tab-nav button.selected {
     color: var(--sl-accent-bright) !important;
     border-bottom: 2px solid var(--sl-accent) !important;
     background: var(--sl-accent-soft) !important;
+    box-shadow: inset 0 -2px 0 var(--sl-accent) !important;
 }
 .gradio-container .overflow-menu button {
     color: var(--sl-text-bright) !important;
@@ -2085,6 +2406,43 @@ CUSTOM_CSS = """
 .gradio-container textarea:focus {
     border-color: var(--sl-accent) !important;
     box-shadow: 0 0 0 3px var(--sl-accent-soft) !important;
+}
+.readable-select input,
+.readable-select [role="listbox"] input,
+.readable-select .secondary-wrap input,
+.gradio-container input.border-none,
+.gradio-container .secondary-wrap input {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+    -webkit-text-fill-color: #0f172a !important;
+    opacity: 1 !important;
+}
+.readable-select input::placeholder,
+.gradio-container input.border-none::placeholder,
+.gradio-container .secondary-wrap input::placeholder {
+    color: #64748b !important;
+    -webkit-text-fill-color: #64748b !important;
+    opacity: 1 !important;
+}
+.readable-select .wrap,
+.readable-select .wrap-inner,
+.readable-select .secondary-wrap,
+.gradio-container .wrap:has(input.border-none),
+.gradio-container .wrap-inner:has(input.border-none),
+.gradio-container .secondary-wrap:has(input.border-none) {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+    border-color: rgba(96, 165, 250, 0.38) !important;
+}
+.readable-select label,
+.readable-select span {
+    color: var(--sl-muted) !important;
+}
+.readable-select [role="option"],
+.readable-select li,
+.gradio-container [role="option"],
+.gradio-container li[role="option"] {
+    color: #0f172a !important;
 }
 
 /* ===== BUTTONS ===== */
@@ -2148,6 +2506,7 @@ CUSTOM_CSS = """
 .page-row { align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
 .page-label { text-align: center; color: var(--sl-muted) !important; min-width: 180px; }
 
+.source-badge.semantic { color: #a78bfa !important; background: rgba(167, 139, 250, 0.12); border: 1px solid rgba(167, 139, 250, 0.35); }
 .source-badge.openalex { color: #22d3ee !important; background: rgba(34, 211, 238, 0.1); border: 1px solid rgba(34, 211, 238, 0.3); }
 .source-badge.crossref { color: #fbbf24 !important; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); }
 .source-badge.arxiv { color: #f87171 !important; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); }
@@ -2330,6 +2689,8 @@ CUSTOM_CSS = """
 }
 .constellation-empty p { max-width: 520px; margin: 0; }
 
+/* (UI/UX polish layer reverted - it caused a layout regression) */
+
 /* Remove system buttons and footers */
 .settings, footer, .show-api { display: none !important; }
 
@@ -2387,7 +2748,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
     with gr.Blocks(title=APP_TITLE) as app:
         with gr.Column(elem_classes=["main-shell"]):
             gr.HTML(
-                """
+                f"""
                 <header class="app-header">
                     <div class="header-row">
                         <div class="crest">🔬</div>
@@ -2395,10 +2756,12 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             <h1>Scholar <span class="accent">Lens</span></h1>
                             <p>Small-model literature review for atmospheric science</p>
                             <div class="header-chips">
+                                <span class="header-chip">Semantic Scholar</span>
                                 <span class="header-chip">OpenAlex</span>
                                 <span class="header-chip">Crossref</span>
                                 <span class="header-chip">arXiv</span>
                                 <span class="header-chip">PubMed</span>
+                                <span class="header-chip">{MODEL_PROVIDER_BADGE}</span>
                             </div>
                         </div>
                     </div>
@@ -2413,10 +2776,10 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
             with gr.Tabs(selected="ask") as app_tabs:
                 with gr.Tab("💬  Ask", id="ask"):
                     gr.Markdown(
-                        "Ask a research question. Scholar Lens searches **OpenAlex, "
-                        "Crossref, arXiv, and PubMed**, then Qwen2.5 3B writes "
-                        "a synthesized, **cited** answer grounded "
-                        "only in the retrieved abstracts.",
+                        f"Ask a research question. Scholar Lens searches **OpenAlex, "
+                        f"Crossref, arXiv, and PubMed**, then **{MODEL_DISPLAY_NAME}** "
+                        f"writes a synthesized, **cited** answer grounded only in the "
+                        f"retrieved abstracts.",
                         elem_classes=["ask-intro"],
                     )
                     with gr.Row():
@@ -2460,7 +2823,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
 
                 with gr.Tab("Compare", id="compare"):
                     gr.Markdown(
-                        "Search for papers, choose any two results, and ask the AI to compare their methods, claims, limitations, and best use cases.",
+                        f"Search for papers, choose any two results, and ask {MODEL_DISPLAY_NAME} to compare their methods, claims, limitations, and best use cases.",
                         elem_classes=["ask-intro"],
                     )
                     with gr.Row(elem_classes=["action-row"]):
@@ -2470,6 +2833,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             type="index",
                             interactive=True,
                             scale=1,
+                            elem_classes=["readable-select"],
                         )
                         compare_right_selector = gr.Dropdown(
                             label="Paper B",
@@ -2477,8 +2841,9 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             type="index",
                             interactive=True,
                             scale=1,
+                            elem_classes=["readable-select"],
                         )
-                        compare_button = gr.Button("Compare with AI", variant="primary", scale=0, min_width=170)
+                        compare_button = gr.Button("Compare with Nemotron", variant="primary", scale=0, min_width=190)
                     compare_output = gr.Markdown(
                         DEFAULT_COMPARE_ANSWER,
                         elem_classes=["answer-card"],
@@ -2493,10 +2858,11 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                 with gr.Tab("🔍  Search", id="search"):
                     with gr.Row():
                         query_input = gr.Textbox(
-                            label="Search topic",
-                            placeholder="Enter research topic (e.g., 'Quantum computing in drug discovery')",
+                            label="Search topic or keywords",
+                            placeholder="One topic, or several keywords separated by commas/new lines",
                             scale=5,
                             container=False,
+                            lines=2,
                             max_length=SEARCH_QUERY_CHAR_LIMIT,
                         )
                         search_button = gr.Button("🔍 Search", variant="primary", scale=1)
@@ -2532,6 +2898,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             type="index",
                             interactive=True,
                             scale=4,
+                            elem_classes=["readable-select"],
                         )
                         with gr.Column(scale=1):
                             summarize_selected_button = gr.Button("✨ Summarize Now", variant="primary")
@@ -2586,6 +2953,10 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     )
 
                 with gr.Tab("Constellation", id="constellation"):
+                    gr.Markdown(
+                        "Start the demo here: build a literature constellation, pick two papers, then use Nemotron for grounded comparison.",
+                        elem_classes=["ask-intro"],
+                    )
                     with gr.Row():
                         graph_query = gr.Textbox(
                             label="Constellation topic",
@@ -2697,7 +3068,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                     # Native dropdown selection (type="index" gives the chosen
                     # paper's index directly) — no JS, no race conditions.
                     summarize_selected_button.click(
-                        fn=summarize_selected_paper_reset_chat,
+                        fn=load_selected_paper_reset_chat,
                         inputs=[paper_selector, papers_state],
                         outputs=[
                             source_text,
@@ -2747,7 +3118,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             <p>
                                 It performs real-time searches across <strong>OpenAlex</strong>,
                                 <strong>Crossref</strong>, <strong>arXiv</strong>, and <strong>PubMed</strong>
-                                using parallel processing, then uses <strong>Qwen2.5 3B</strong>,
+                                using parallel processing, then uses <strong>{MODEL_DISPLAY_NAME}</strong>,
                                 hosted on Modal, to do the heavy lifting.
                             </p>
                             <p>
@@ -2759,7 +3130,7 @@ def build_app() -> tuple[gr.Blocks, gr.themes.Base]:
                             </p>
                             <p style="margin-top: 16px; font-size: 13px; color: var(--sl-muted);">
                                 Built for the Hugging Face <em>Build Small</em> hackathon &middot;
-                                model small enough for the consumer-GPU story.
+                                {MODEL_PROVIDER_BADGE} &middot; model small enough for the consumer-GPU story.
                             </p>
                             {_render_rubric_proof()}
                         </div>
@@ -2814,5 +3185,3 @@ if __name__ == "__main__":
         css=CUSTOM_CSS,
         head=HEAD_SCRIPT,
     )
-
-

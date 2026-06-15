@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from pathlib import Path
 
 import app
 
@@ -51,6 +52,41 @@ class AppCoreTests(unittest.TestCase):
 
         self.assertEqual(ranked[0], older_relevant)
 
+    def test_split_search_queries_accepts_multiple_keywords(self):
+        queries = app._split_search_queries("aerosols, cloud feedback\nsatellite rainfall; aerosols")
+
+        self.assertEqual(queries, ["aerosols", "cloud feedback", "satellite rainfall"])
+
+    def test_collect_results_merges_multiple_keyword_searches(self):
+        first = paper("Aerosol cloud interactions", abstract="aerosol cloud")
+        second = paper("Satellite rainfall retrieval", abstract="satellite rainfall")
+
+        with patch(
+            "app._collect_single_query_results",
+            side_effect=[([first], []), ([second], [])],
+        ) as mocked:
+            results, warnings = app._collect_results("aerosols, satellite rainfall")
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual({result.title for result in results}, {first.title, second.title})
+        self.assertEqual(warnings, [])
+
+    def test_search_all_sources_reports_multiple_keyword_searches(self):
+        with patch(
+            "app._collect_results",
+            return_value=([paper("Aerosol cloud interactions")], []),
+        ):
+            status, *_ = app.search_all_sources("aerosols, cloud feedback")
+
+        self.assertIn("2", status)
+        self.assertIn("keyword searches", status)
+
+    def test_render_result_insights_handles_results(self):
+        panel = app._render_result_insights([paper("Aerosol cloud interactions")])
+
+        self.assertIn("Papers", panel)
+        self.assertIn("Top Source", panel)
+
     def test_context_builder_respects_budget(self):
         long_abstract = "cancer detection " * 1000
         papers = [paper(f"Paper {index}", abstract=long_abstract) for index in range(20)]
@@ -77,7 +113,7 @@ class AppCoreTests(unittest.TestCase):
         self.assertIsNone(result[18])
         self.assertEqual(result[21], app.DEFAULT_PAPER_CHAT_ANSWER)
         self.assertEqual(result[25], app.DEFAULT_COMPARE_ANSWER)
-        self.assertIn("Connectome Constellation", result[26])
+        self.assertIn("Literature Constellation", result[26])
 
     def test_pagination_updates_disable_edges(self):
         papers = [paper(f"Paper {index}") for index in range(app.RESULTS_PER_PAGE + 1)]
@@ -126,7 +162,29 @@ class AppCoreTests(unittest.TestCase):
 
         self.assertIn("Backyard AI proof points", panel)
         self.assertIn("Real professor workflow", panel)
-        self.assertIn("Small-model fit", panel)
+        self.assertIn("NVIDIA Nemotron fit", panel)
+        self.assertIn(app.MODEL_DISPLAY_NAME, panel)
+
+    def test_public_model_story_is_nvidia_nemotron(self):
+        self.assertEqual(
+            app.MODEL_ID,
+            "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        )
+        self.assertEqual(app.MODEL_PROVIDER_BADGE, "Powered by NVIDIA Nemotron on Modal")
+        self.assertIn("Nemotron", app.MODEL_DISPLAY_NAME)
+
+    def test_modal_default_model_is_nemotron_nano(self):
+        modal_source = Path(app.__file__).with_name("modal_inference.py").read_text(
+            encoding="utf-8",
+        )
+
+        self.assertIn(
+            '"nvidia/Llama-3.1-Nemotron-Nano-8B-v1"',
+            modal_source,
+        )
+        self.assertIn("trust_remote_code=True", modal_source)
+        self.assertIn("enforce_eager=True", modal_source)
+        self.assertIn("Use only the supplied context", modal_source)
 
     def test_load_selected_paper_returns_context(self):
         item = paper("Useful Paper", abstract="A clear abstract about useful results.")
@@ -136,6 +194,20 @@ class AppCoreTests(unittest.TestCase):
         self.assertIn("Useful Paper", paper_text)
         self.assertIn("Loaded", status)
         self.assertEqual(summary, "")
+        self.assertEqual(tab_update["selected"], "summarize")
+
+    def test_summarize_now_loads_tab_without_modal_call(self):
+        item = paper("Useful Paper", abstract="A clear abstract about useful results.")
+        with patch("app.summarize_with_modal") as mocked:
+            paper_text, status, summary, tab_update, *_ = app.load_selected_paper_reset_chat(
+                0,
+                [item],
+            )
+
+        mocked.assert_not_called()
+        self.assertIn("Useful Paper", paper_text)
+        self.assertIn("Loaded", status)
+        self.assertIn("Click Summarize with AI", summary)
         self.assertEqual(tab_update["selected"], "summarize")
 
     def test_export_results_csv_creates_file(self):
@@ -188,6 +260,44 @@ class AppCoreTests(unittest.TestCase):
         self.assertTrue(graph["data_completeness"]["keyword_fallback_used"])
         self.assertEqual(graph["data_completeness"]["paper_count"], 2)
         self.assertIn("nodes", graph)
+
+    def test_constellation_community_ids_match_nodes(self):
+        graph = app.build_constellation_from_papers(
+            "mixed methods",
+            [
+                paper("Functional graph modularity", abstract="graph modularity community"),
+                paper("Clinical disease cohort", abstract="clinical disease disorder"),
+                paper("Diffusion tractography", abstract="structural diffusion tractography"),
+            ],
+        )
+        community_ids = {community["id"] for community in graph["communities"]}
+
+        self.assertTrue({node["community"] for node in graph["nodes"]}.issubset(community_ids))
+
+    def test_constellation_render_has_nonblank_fallback(self):
+        graph = app.build_constellation_from_papers(
+            "connectome",
+            [paper("Functional connectome graph theory", abstract="modularity graph network")],
+        )
+        html = app._render_constellation_html(graph)
+
+        self.assertIn("Literature Constellation", html)
+        self.assertIn("CONNECTED LITERATURE MAP", html)
+        self.assertIn("canvas", html)
+        self.assertNotIn("Connectome Constellation", html)
+
+    def test_compare_prompt_names_nemotron(self):
+        results = [
+            paper("Paper A", abstract="A studies rainfall with satellite data."),
+            paper("Paper B", abstract="B studies rainfall with station data."),
+        ]
+        with patch("app.synthesize_with_modal", return_value="comparison") as mocked:
+            result = app.compare_papers_with_ai(0, 1, results)
+
+        self.assertEqual(result, "comparison")
+        prompt = mocked.call_args.args[0]
+        self.assertIn(app.MODEL_DISPLAY_NAME, prompt)
+        self.assertIn("Use only the provided metadata", prompt)
 
     def test_export_corpus_zip_includes_graph_json(self):
         graph = app.build_constellation_from_papers(
